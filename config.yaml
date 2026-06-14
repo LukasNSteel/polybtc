@@ -1,0 +1,248 @@
+# polybtc bot configuration
+
+asset: BTC
+binance_symbol: BTCUSDT
+
+perp_lead:
+  # Binance USDT-M perpetual futures lead spot by a beat in fast moves
+  # (price discovery happens on the perp). The bot tracks the rolling
+  # perp-spot basis and uses (perp mid - basis) as its spot estimate
+  # whenever the perp print is fresher than the spot print. Markets still
+  # resolve on spot/Chainlink, so this is only a faster estimator of spot.
+  # Disable if your region blocks fstream.binance.com (spot still works).
+  enabled: true
+  symbol: BTCUSDT
+  basis_halflife_sec: 120
+
+coinbase:
+  # Coinbase BBO as an independent fast price signal. It enters the
+  # composite *basis-adjusted* — (coinbase mid - rolling coinbase-binance
+  # basis) — exactly like the perp, so the composite always stays in the
+  # Binance price frame. The candle open and settlement reference are
+  # Binance prices; blending raw Coinbase levels (which trade $50-100 off
+  # Binance) injected a permanent directional skew into P(up) and made
+  # session 1781182217 buy DOWN 219 times out of 222 (-$660).
+  # Purely additive — if the feed drops, Binance spot drives fair value.
+  enabled: true
+  symbol: BTC-USD
+  weight: 0.5              # Coinbase share in composite spot (Binance gets 1-weight)
+
+liquidations:
+  # Binance USDT-M @forceOrder stream. Large liquidation prints often
+  # precede fast spot moves — trigger the jump guard to pull MM quotes.
+  # Sniper/scalper keep running; a cascade is exactly their moment.
+  enabled: true
+  min_notional_usd: 50000  # ignore small liquidations
+  pause_sec: 8             # MM pause duration per significant liquidation
+
+markets:
+  # NOTE on paper settlement: the simulator settles every market on Binance
+  # spot klines, including the 5m/15m/4h markets that really resolve via
+  # Chainlink BTC/USD. This is a deliberate approximation: model spot, candle
+  # open and sim settlement all share the Binance frame, so no systematic
+  # bias enters — but individual windows where Chainlink and Binance disagree
+  # at the close (a ~$50-100 basis moving in the final seconds) can settle
+  # differently than they would live. Treat paper results near 50/50 closes
+  # with extra skepticism.
+  five_minute: true     # btc-updown-5m-{epoch} markets (resolve via Chainlink BTC/USD)
+  fifteen_minute: true  # btc-updown-15m-{epoch} markets (resolve via Chainlink BTC/USD);
+                        # the target account's single biggest day-1 volume bucket
+  hourly: true          # Bitcoin Up or Down hourly (resolve via Binance BTC/USDT 1h candle)
+  four_hour: true       # btc-updown-4h-{epoch} markets (resolve via Chainlink BTC/USD);
+                        # lower volume (~$145k/day vs hourly's ~$1M) but same window mechanics
+
+trading:
+  # stop placing orders this many seconds before window close, per market kind.
+  # Empirically verified (June 2026): both 5m and hourly BTC markets accept
+  # orders all the way to expiry. The bot also tracks each market's live
+  # accepting_orders flag from the CLOB, so if Polymarket introduces a halt
+  # it is honored automatically; raise these for an extra safety margin.
+  cutoff_sec_5m: 0
+  cutoff_sec_15m: 0
+  cutoff_sec_hourly: 0
+  cutoff_sec_4h: 0
+
+fair_value:
+  vol_halflife_fast_sec: 60    # fast EWMA reacts to vol bursts
+  vol_halflife_slow_sec: 600   # slow EWMA anchors the baseline; max() of both is used
+  min_vol_per_sec: 0.00002     # floor so fair value never divides by ~0
+  tail_weight: 0.25            # weight of the wide "jump" regime (fat tails)
+  tail_scale: 2.5              # how much wider the jump regime is
+  blend_model_weight: 0.65     # weight on our model vs the market mid
+                               # (rises toward 0.95 in the final minute)
+  # Momentum drift: the zero-drift model overprices the side a trend is
+  # fading — session 1781212299's MM fills won only 42% (3-5c of adverse
+  # selection per fill) because after every directional run the model kept
+  # calling the losing side "cheap" and both MM and sniper bought it.
+  # Expected continuation = beta * (return over the last window), scaled by
+  # remaining time and clamped in sigma units.
+  momentum_window_sec: 60
+  momentum_beta: 0.5           # 0 disables; 1 = assume the full run repeats
+  momentum_clamp_sigma: 1.5    # cap |drift| at this many diffusion sigmas
+
+market_maker:
+  # DISABLED after the June 2026 data study (research/REPORT.md, Test 6):
+  # simulated passive bids lose -2 to -3c per fill at EVERY depth from 2c to
+  # 8c, on every market kind (CIs exclude zero), and the bot's own live
+  # sessions agree (-$173, 251 losing-side vs 211 winning-side fills). Fills
+  # only happen when the move reaches the quote and keeps going; the ~0.3c
+  # maker rebate cannot close that gap. Symmetric resting quotes on these
+  # markets are donations to Binance-watching takers.
+  enabled: false
+  edge: 0.04                   # quote this far below fair value (4 cents)
+  edge_ref_sec: 300            # edge scales by sqrt(t_remaining / this), min 1x:
+                               # ~1x for 5m, ~1.7x for 15m, capped for hourly
+  edge_max_mult: 3.0           # cap on the horizon multiplier (hourly ~= 12c)
+  min_quote: 0.10              # never bid below this: penny bids on a nearly-
+                               # decided side are where the fat-tail model
+                               # overprices most (mirrors sniper.min_ask)
+  max_quote: 0.85              # never bid above this (mirror case)
+  max_quote_shares: 150        # share cap per quote, so cheap quotes can't
+                               # balloon into 1000-share lots
+  inventory_skew: 1.0          # widen the edge up to (1+skew)x as directional
+                               # inventory approaches max_position_usd
+  quote_size_usd: 10           # USDC notional per quote
+  reprice_threshold: 0.015     # move quotes when fair value shifts by this much
+  stop_quoting_sec: 25         # pull MM quotes this close to expiry
+  max_position_usd: 100        # max cost basis per market window (was 150: the
+                               # worst session-1781212299 losers were exactly
+                               # cap-sized — the cap is the loss tail)
+  # Trend filter: pull the bid on the side a directional run is fading —
+  # repricing lags the move, so that quote is structurally stale. Momentum
+  # measured as return over trend_window_sec in units of expected vol.
+  trend_filter_sigma: 1.2      # pull when momentum exceeds this (0 disables)
+  trend_window_sec: 45
+
+sniper:
+  # RESHAPED June 12 after live forensics (research/analyze_sessions.py,
+  # research/analyze_tau.py — 307 settled paper fills across 9 sessions).
+  # The backtested "+55%/$1" snipe realized -19.6%/$1 live. The split:
+  #   buying the FAVORITE side (ask >= 0.50): 73% win, +$304, positive on
+  #     every market kind and both sides — the genuine book-lags-Binance trade;
+  #   buying the UNDERDOG side (ask < 0.50): 18% win, -$1,660, negative
+  #     everywhere — betting the model's sign-flip against the market.
+  # calibration.csv agrees: where model and market disagree on sign, the
+  # market wins (predicted 0.35 -> realized 0.45). The backtest missed this
+  # because it assumed we capture every qualifying print; live, 219 FAK
+  # orders lost the race, and what we actually filled was adversely selected.
+  enabled: true
+  min_edge: 0.10               # gate on the dual-beta ROBUST edge (worst-case
+                               # P across both regimes)
+  max_edge: 0.25               # winner's-curse veto, REINSTATED: a giant edge
+                               # still on the book 350ms after the move is one
+                               # the fast bots passed on. Our live edge>=0.15
+                               # fills went 0-for-5 (-104%/$1).
+  robust_betas: [0.83, 1.36]   # lead-stickiness regimes fitted per-day on 1,847
+                               # markets: ~0.8-0.9 mean-reversion days, ~1.2-1.4
+                               # momentum days. Entry must be +EV under BOTH.
+  min_ask: 0.50                # FAVORITE-ONLY: never buy the side the market
+                               # prices under 50% no matter what the model says.
+                               # We trade repricing lag in magnitude, never sign.
+                               # (was 0.05; sub-0.5 asks were -33%/$1 live)
+  max_ask: 0.80                # above this the snipe edge was fee-dead live
+                               # (-21.6%); near-certainty buys belong to the
+                               # scalper and its 0.997 probability gate
+  max_take_usd: 100            # capacity is there: median ~$650 printed notional
+                               # per qualifying 5m market in the edge bucket
+  max_position_usd: 150        # per-market snipe cost cap (decoupled from the
+                               # now-disabled MM leg's cap)
+  max_inventory_frac: 0.25     # skip a side once net same-side inventory exceeds
+                               # this fraction of max_position_usd: stacking one
+                               # side on the same lagging signal built every
+                               # cap-sized loser in session 1781212299
+
+scalper:
+  # Restricted after the June 2026 study (research/REPORT.md, Test 3):
+  # late high-price buys are +EV on 1h (+2.2%/$1, 14/15 days green) and mildly
+  # positive on 15m, but NEGATIVE on 5m (-1.7%/$1; -4.6% at 0.97-0.99 with
+  # 30-60s left) and untested on 4h. Anything at 0.99+ is fee-dead everywhere.
+  enabled: true
+  kinds: [15m, 1h]             # 5m and 4h excluded — see above
+  window_sec: 60               # only act in the final N seconds
+  min_tau_sec: 15              # ...but not the very last seconds: resolution-
+                               # source noise (Chainlink/Binance close prints)
+                               # is concentrated there
+  min_tau_sec_15m: 5           # 15m can run closer to the wire — the study's
+                               # best 15m scalp bucket is tau 5-30s (+3-6%/$1)
+  min_prob: 0.997              # fair probability must exceed this
+  min_price: 0.90              # the scalp thesis is paying up for near-certainty;
+                               # a cheap ask on a "certain" side means the whole
+                               # market disagrees with the model and wins that
+                               # argument (it can also see the resolution source)
+  max_price: 0.99              # was 0.999: above 0.99 the fee eats the entire
+                               # edge (+0.3-0.6%/$1 at best, n.s.)
+  max_usd: 100                 # max USDC per scalp
+
+guards:
+  # Adverse-selection defenses for the MM leg (the sniper/scalper are
+  # unaffected — a jump is exactly when they should act).
+  # Jump guard: when BTC moves more than jump_sigma standard deviations
+  # (floored at jump_min_move_bps) inside the window, pull all MM quotes
+  # and pause re-quoting — our resting bids are the stale quotes mid-burst.
+  jump_window_sec: 3
+  jump_sigma: 5.0
+  jump_min_move_bps: 5
+  jump_cooldown_sec: 10
+  # Quote fading: each MM fill on a side pushes that side's next quote this
+  # much further from fair (decaying window, capped) — a fast informed
+  # trader can't clear us out repeatedly at one stale level.
+  # (session 1781170769: 65% of MM fills ended on the losing side with the
+  # old 0.005/0.02 fade — half a tick per fill was no deterrent at all;
+  # session 1781212299 measured 3-5c adverse selection per fill, so the cap
+  # must exceed that or the fade saturates below the toxicity level)
+  fade_per_fill: 0.03
+  fade_window_sec: 60
+  fade_max: 0.10
+  # Same-side fill breaker: this many MM fills on one side within the window
+  # stops quoting that side for the cooldown. Two fills are already signal,
+  # not noise (the third+ fills in session 1781212299 all lost), and 420s
+  # keeps a tripped side off for the remainder of any 5m window instead of
+  # re-arming into the same trend after 180s.
+  breaker_fills: 2
+  breaker_window_sec: 60
+  breaker_cooldown_sec: 420
+  # Markouts: post-fill book-mid drift at these horizons, reported per leg
+  # in the session summary. Persistently negative MM markouts mean the flow
+  # hitting our quotes is informed — widen market_maker.edge.
+  markout_horizons_sec: [10, 60]
+
+risk:
+  max_total_exposure_usd: 500  # global cap on open cost basis
+  kill_switch_loss_usd: 300    # stop trading if equity drops this far below the
+                               # *session start* equity (not all-time start cash:
+                               # banked profit must not raise the pain threshold).
+                               # Raised from 200: snipe pnl is fat-tailed (51% of
+                               # markets net-positive, top-10 markets ~half the
+                               # profit) — too tight a switch stops out of variance
+  max_feed_age_sec: 5          # pull all quotes if the price feed stalls this long
+  vol_warmup_sec: 90           # no sniper/scalper trades until the vol EWMA has
+                               # this many seconds of samples. At cold start vol
+                               # sits at the min_vol floor (~3x too low), the
+                               # model's d is inflated ~3x, and tiny wobbles
+                               # around the candle open read as 11-14c edges on
+                               # BOTH sides in sequence (session 1781248550:
+                               # -$67 in the first 14 seconds of the session)
+
+paper:
+  starting_cash: 1000
+  # execution realism. Taker (snipe/scalp) orders resolve after a simulated
+  # round trip (+-50% jitter) against whatever the book shows *then* — if the
+  # stale ask is gone, the order kills, like losing the race to a faster bot.
+  # Cancels also stay hittable while "in flight". Set both to 0 to restore
+  # instant (optimistic) fills.
+  taker_latency_ms: 350
+  cancel_latency_ms: 150
+
+live:
+  # secrets come from environment variables, never from this file:
+  #   POLYMARKET_PRIVATE_KEY  - EOA private key
+  #   POLYMARKET_FUNDER       - address holding funds (proxy wallet, or the EOA itself)
+  host: https://clob.polymarket.com
+  chain_id: 137
+  # 0 = EOA holds positions directly (required for automatic on-chain merge/redeem)
+  # 1 = email/magic proxy, 2 = browser wallet proxy (merge/redeem via Polymarket UI)
+  signature_type: 0
+  polygon_rpc: https://polygon-rpc.com
+
+log_dir: logs
+state_file: state.json   # positions/cash survive restarts (run with --fresh to ignore)

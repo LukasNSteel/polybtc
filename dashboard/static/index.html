@@ -1,0 +1,420 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>polybtc</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+<style>
+  :root {
+    --bg: #0b0e14; --panel: #11151f; --panel2: #161b28; --border: #1f2637;
+    --text: #d6dbe8; --dim: #7d8699; --faint: #4a5263;
+    --green: #2dd4a0; --red: #f3655b; --blue: #5aa2f7; --amber: #e8b34b;
+    --purple: #a78bfa;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg); color: var(--text);
+    font: 13px/1.45 -apple-system, "SF Pro Text", "Segoe UI", Roboto, sans-serif;
+    padding: 18px 22px 40px;
+  }
+  ::-webkit-scrollbar { width: 8px; height: 8px; }
+  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+
+  header { display: flex; align-items: center; gap: 14px; margin-bottom: 16px; flex-wrap: wrap; }
+  header h1 { font-size: 17px; font-weight: 650; letter-spacing: .3px; }
+  header h1 span { color: var(--blue); }
+  .pill {
+    font-size: 11px; font-weight: 600; padding: 3px 9px; border-radius: 99px;
+    border: 1px solid var(--border); color: var(--dim); display: inline-flex;
+    align-items: center; gap: 6px;
+  }
+  .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--faint); }
+  .dot.live { background: var(--green); box-shadow: 0 0 6px var(--green); }
+  .dot.stale { background: var(--amber); }
+  .dot.dead { background: var(--red); }
+  select {
+    background: var(--panel2); color: var(--text); border: 1px solid var(--border);
+    border-radius: 7px; padding: 5px 9px; font-size: 12px; outline: none;
+  }
+  header .right { margin-left: auto; color: var(--faint); font-size: 11px; }
+
+  .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(128px, 1fr)); gap: 10px; margin-bottom: 14px; }
+  .kpi { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 10px 13px; }
+  .kpi .label { font-size: 10.5px; text-transform: uppercase; letter-spacing: .7px; color: var(--dim); margin-bottom: 4px; }
+  .kpi .value { font-size: 19px; font-weight: 650; font-variant-numeric: tabular-nums; }
+  .kpi .sub { font-size: 10.5px; color: var(--faint); margin-top: 2px; }
+  .pos { color: var(--green); } .neg { color: var(--red); }
+
+  .grid { display: grid; grid-template-columns: 2fr 1fr; gap: 12px; }
+  @media (max-width: 1100px) { .grid { grid-template-columns: 1fr; } }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 14px 16px; margin-bottom: 12px; }
+  .panel h2 {
+    font-size: 11.5px; font-weight: 650; text-transform: uppercase; letter-spacing: .8px;
+    color: var(--dim); margin-bottom: 10px; display: flex; justify-content: space-between;
+  }
+  .panel h2 small { font-weight: 500; text-transform: none; letter-spacing: 0; color: var(--faint); }
+  .chart-wrap { position: relative; height: 220px; }
+  .chart-wrap.tall { height: 260px; }
+  .chart-wrap.short { height: 170px; }
+
+  table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  th { font-size: 10.5px; text-transform: uppercase; letter-spacing: .6px; color: var(--dim);
+       text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--border); position: sticky; top: 0; background: var(--panel); }
+  td { padding: 5px 8px; border-bottom: 1px solid #151a26; font-size: 12.5px; }
+  tr:last-child td { border-bottom: none; }
+  td.num, th.num { text-align: right; }
+  .scroll { max-height: 340px; overflow-y: auto; }
+
+  .badge { font-size: 10px; font-weight: 700; padding: 2px 7px; border-radius: 5px; letter-spacing: .4px; }
+  .badge.mm    { background: #1d2c4d; color: var(--blue); }
+  .badge.snipe { background: #173a31; color: var(--green); }
+  .badge.scalp { background: #3a2c14; color: var(--amber); }
+  .badge.settle{ background: #2b2344; color: var(--purple); }
+  .badge.guard { background: #3d1f1e; color: var(--red); }
+  .badge.UP { background: #173a31; color: var(--green); }
+  .badge.DN, .badge.DOWN { background: #3d1f1e; color: var(--red); }
+  .muted { color: var(--faint); }
+  .mkt { color: var(--dim); max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .close-legend { display: inline-flex; gap: 10px; margin-left: 6px; font-weight: 500; }
+  .close-legend span { display: inline-flex; align-items: center; gap: 4px; }
+  .close-legend i { display: inline-block; width: 14px; height: 0; border-top: 2px dashed; }
+  .close-legend i.l5  { border-color: rgba(125, 134, 153, 0.55); }
+  .close-legend i.l15 { border-color: rgba(125, 134, 153, 0.85); }
+  .close-legend i.l1h { border-color: rgba(90, 162, 247, 0.85); border-top-width: 2px; }
+  .close-legend i.l4h { border-color: rgba(167, 139, 250, 0.9); border-top-style: solid; }
+</style>
+</head>
+<body>
+<header>
+  <h1>poly<span>btc</span></h1>
+  <span class="pill"><span class="dot" id="live-dot"></span><span id="live-label">connecting</span></span>
+  <span class="pill" id="mode-pill">—</span>
+  <select id="session-sel"></select>
+  <span class="right" id="updated"></span>
+</header>
+
+<div id="err"></div>
+
+<div class="kpis" id="kpis"></div>
+
+<div class="grid">
+  <div>
+    <div class="panel">
+      <h2>Equity &amp; exposure <small id="eq-sub"></small></h2>
+      <div class="chart-wrap tall"><canvas id="eq-chart"></canvas></div>
+    </div>
+    <div class="panel">
+      <h2>Cumulative settled P&amp;L <small id="settle-sub"></small></h2>
+      <div class="chart-wrap"><canvas id="settled-chart"></canvas></div>
+    </div>
+    <div class="panel">
+      <h2>BTC spot</h2>
+      <div class="chart-wrap short"><canvas id="spot-chart"></canvas></div>
+    </div>
+    <div class="panel">
+      <h2>Activity <small>fills · settlements · guards</small></h2>
+      <div class="scroll">
+        <table id="feed-table">
+          <thead><tr><th>time</th><th>event</th><th>side</th><th>market</th><th>detail</th><th class="num">$</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <div>
+    <div class="panel">
+      <h2>P&amp;L by leg <small>settled markets</small></h2>
+      <div class="chart-wrap short"><canvas id="leg-chart"></canvas></div>
+      <table id="leg-table" style="margin-top:8px">
+        <thead><tr><th>leg</th><th class="num">fills</th><th class="num">win/loss</th><th class="num">cost</th><th class="num">pnl</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <div class="panel">
+      <h2>P&amp;L by market kind</h2>
+      <table id="kind-table">
+        <thead><tr><th>kind</th><th class="num">markets</th><th class="num">cost</th><th class="num">pnl</th><th class="num">ret</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <div class="panel">
+      <h2>Open positions <small id="pos-sub"></small></h2>
+      <div class="scroll">
+        <table id="pos-table">
+          <thead><tr><th>market</th><th>kind</th><th class="num">up</th><th class="num">dn</th><th class="num">cost</th><th class="num">closes</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+    <div class="panel">
+      <h2>Settlement P&amp;L distribution</h2>
+      <div class="chart-wrap short"><canvas id="hist-chart"></canvas></div>
+    </div>
+  </div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const fmt$ = (v, sign) => {
+  if (v == null) return "—";
+  const prefix = v < 0 ? "-" : (sign && v > 0 ? "+" : "");
+  const a = Math.abs(v);
+  const body = a >= 1000 ? a.toLocaleString(undefined, {maximumFractionDigits: 0}) : a.toFixed(2);
+  return `${prefix}$${body}`;
+};
+const cls = (v) => v > 0 ? "pos" : v < 0 ? "neg" : "";
+const tfmt = (ts) => new Date(ts * 1000).toLocaleTimeString([], {hour12: false});
+const ago = (s) => s < 60 ? `${s.toFixed(0)}s` : s < 3600 ? `${(s/60).toFixed(0)}m` : `${(s/3600).toFixed(1)}h`;
+
+Chart.defaults.color = "#7d8699";
+Chart.defaults.borderColor = "#1f2637";
+Chart.defaults.font.family = "-apple-system, 'SF Pro Text', 'Segoe UI', Roboto, sans-serif";
+Chart.defaults.font.size = 10.5;
+Chart.defaults.animation = false;
+Chart.defaults.plugins.legend.display = false;
+
+const CLOSE_LINE_STYLE = {
+  "5m":  { color: "rgba(125, 134, 153, 0.22)", width: 1,   dash: [2, 6] },
+  "15m": { color: "rgba(125, 134, 153, 0.50)", width: 1,   dash: [5, 4] },
+  "1h":  { color: "rgba(90, 162, 247, 0.65)",  width: 1.5, dash: [8, 4] },
+  "4h":  { color: "rgba(167, 139, 250, 0.75)", width: 2,   dash: [2, 2] },
+};
+const CLOSE_LINE_ORDER = ["5m", "15m", "4h", "1h"];
+
+const closeLinesPlugin = {
+  id: "closeLines",
+  afterDraw(chart, _args, opts) {
+    const byKind = opts?.byKind;
+    if (!byKind || !Object.keys(byKind).length) return;
+    const { ctx, chartArea, scales } = chart;
+    if (!scales.x || !chartArea) return;
+    ctx.save();
+    for (const kind of CLOSE_LINE_ORDER) {
+      const lines = byKind[kind];
+      if (!lines?.length) continue;
+      const style = CLOSE_LINE_STYLE[kind] || CLOSE_LINE_STYLE["15m"];
+      ctx.strokeStyle = style.color;
+      ctx.lineWidth = style.width;
+      ctx.setLineDash(style.dash);
+      for (const ts of lines) {
+        const x = scales.x.getPixelForValue(ts);
+        if (x < chartArea.left - 1 || x > chartArea.right + 1) continue;
+        ctx.beginPath();
+        ctx.moveTo(x, chartArea.top);
+        ctx.lineTo(x, chartArea.bottom);
+        ctx.stroke();
+      }
+    }
+    ctx.restore();
+  },
+};
+Chart.register(closeLinesPlugin);
+
+const timeOpts = (unit) => ({
+  type: "linear",
+  ticks: { maxTicksLimit: 7, callback: (v) => tfmt(v) },
+  grid: { display: false },
+});
+
+const charts = {};
+function lineChart(id, datasets, opts = {}) {
+  const closeLineOpts = { byKind: opts.closeLinesByKind || {} };
+  if (charts[id]) {
+    datasets.forEach((src, i) => Object.assign(charts[id].data.datasets[i], src));
+    charts[id].options.plugins.closeLines = closeLineOpts;
+    charts[id].update("none");
+    return;
+  }
+  charts[id] = new Chart($(id), {
+    type: "line",
+    data: { datasets },
+    options: {
+      maintainAspectRatio: false, responsive: true,
+      interaction: { mode: "nearest", axis: "x", intersect: false },
+      scales: Object.assign({ x: timeOpts(), y: { grid: { color: "#161c2b" } } }, opts.scales || {}),
+      plugins: { legend: { display: !!opts.legend, labels: { boxWidth: 10, boxHeight: 2 } },
+                 tooltip: { callbacks: { title: (it) => tfmt(it[0].parsed.x) } },
+                 closeLines: closeLineOpts },
+    },
+  });
+}
+
+function renderKpis(k) {
+  const items = [
+    ["Equity", fmt$(k.equity), null],
+    ["Session P&L", fmt$(k.session_pnl, true), cls(k.session_pnl)],
+    ["Settled P&L", fmt$(k.settled_pnl, true), cls(k.settled_pnl)],
+    ["Cash", fmt$(k.cash), null],
+    ["Exposure", fmt$(k.exposure), null],
+    ["Open orders", k.open_orders ?? "—", null],
+    ["Fills", k.fills, null],
+    ["Fees paid", fmt$(k.fees_paid), null],
+    ["BTC spot", k.spot ? k.spot.toLocaleString(undefined, {maximumFractionDigits: 0}) : "—", null],
+    ["Vol (1m)", k.vol_1m_pct != null ? k.vol_1m_pct.toFixed(3) + "%" : "—", null],
+  ];
+  $("kpis").innerHTML = items.map(([l, v, c]) =>
+    `<div class="kpi"><div class="label">${l}</div><div class="value ${c || ""}">${v}</div></div>`).join("");
+}
+
+function renderFeed(feed) {
+  $("feed-table").querySelector("tbody").innerHTML = feed.map((e) => {
+    const badge = e.type === "fill" ? `<span class="badge ${e.leg}">${e.leg}</span>`
+      : e.type === "settle" ? `<span class="badge settle">settle</span>`
+      : `<span class="badge guard">guard</span>`;
+    const side = e.side ? `<span class="badge ${e.side}">${e.side}</span>` : "";
+    const usd = e.usd == null ? "" :
+      `<span class="${e.type === "settle" ? cls(e.usd) : ""}">${e.type === "settle" ? (e.usd > 0 ? "+" : "") + e.usd.toFixed(2) : e.usd.toFixed(2)}</span>`;
+    return `<tr><td class="muted">${tfmt(e.ts)}</td><td>${badge}</td><td>${side}</td>
+      <td class="mkt" title="${e.market}">${e.market}</td><td class="muted">${e.detail}</td><td class="num">${usd}</td></tr>`;
+  }).join("");
+}
+
+function renderLegs(stats) {
+  const legs = Object.keys(stats);
+  const data = legs.map((l) => stats[l].pnl);
+  const barColors = data.map((v) => v >= 0 ? "#2dd4a0" : "#f3655b");
+  if (charts["leg-chart"]) { charts["leg-chart"].data.labels = legs; charts["leg-chart"].data.datasets[0].data = data;
+    charts["leg-chart"].data.datasets[0].backgroundColor = barColors; charts["leg-chart"].update("none"); }
+  else charts["leg-chart"] = new Chart($("leg-chart"), {
+    type: "bar",
+    data: { labels: legs, datasets: [{ data, backgroundColor: barColors, borderRadius: 4 }] },
+    options: { maintainAspectRatio: false, scales: { y: { grid: { color: "#161c2b" } }, x: { grid: { display: false } } } },
+  });
+  $("leg-table").querySelector("tbody").innerHTML = legs.map((l) => {
+    const s = stats[l];
+    return `<tr><td><span class="badge ${l}">${l}</span></td><td class="num">${s.fills}</td>
+      <td class="num">${s.wins}/${s.losses}</td><td class="num">$${s.cost.toFixed(0)}</td>
+      <td class="num ${cls(s.pnl)}">${s.pnl > 0 ? "+" : ""}${s.pnl.toFixed(2)}</td></tr>`;
+  }).join("") || `<tr><td colspan="5" class="muted">no settled fills yet</td></tr>`;
+}
+
+function renderKinds(stats) {
+  const kinds = Object.keys(stats).sort();
+  $("kind-table").querySelector("tbody").innerHTML = kinds.map((k) => {
+    const s = stats[k];
+    const ret = s.cost ? (100 * s.pnl / s.cost).toFixed(1) + "%" : "—";
+    return `<tr><td>${k}</td><td class="num">${s.markets}</td><td class="num">$${s.cost.toFixed(0)}</td>
+      <td class="num ${cls(s.pnl)}">${s.pnl > 0 ? "+" : ""}${s.pnl.toFixed(2)}</td>
+      <td class="num ${cls(s.pnl)}">${ret}</td></tr>`;
+  }).join("") || `<tr><td colspan="5" class="muted">no settled markets yet</td></tr>`;
+}
+
+function renderPositions(pos) {
+  $("pos-sub").textContent = pos.length ? `${pos.length} open · $${pos.reduce((a, p) => a + p.cost, 0).toFixed(0)} at risk` : "";
+  $("pos-table").querySelector("tbody").innerHTML = pos.map((p) => {
+    const exp = p.expires_in == null ? "—" : p.expires_in < 0 ? "settling" : ago(p.expires_in);
+    return `<tr><td class="mkt" title="${p.title}">${p.title}</td><td>${p.kind}</td>
+      <td class="num">${p.up}</td><td class="num">${p.dn}</td>
+      <td class="num">$${p.cost.toFixed(2)}</td><td class="num muted">${exp}</td></tr>`;
+  }).join("") || `<tr><td colspan="6" class="muted">flat</td></tr>`;
+}
+
+function renderHist(pnls) {
+  if (!pnls.length) return;
+  const lo = Math.min(...pnls), hi = Math.max(...pnls);
+  const n = 21, w = (hi - lo) / n || 1;
+  const bins = Array(n).fill(0);
+  pnls.forEach((p) => bins[Math.min(n - 1, Math.floor((p - lo) / w))]++);
+  const labels = bins.map((_, i) => (lo + (i + 0.5) * w).toFixed(0));
+  const colors = labels.map((l) => +l >= 0 ? "#2dd4a0" : "#f3655b");
+  if (charts["hist-chart"]) { charts["hist-chart"].data.labels = labels; charts["hist-chart"].data.datasets[0].data = bins;
+    charts["hist-chart"].data.datasets[0].backgroundColor = colors; charts["hist-chart"].update("none"); }
+  else charts["hist-chart"] = new Chart($("hist-chart"), {
+    type: "bar",
+    data: { labels, datasets: [{ data: bins, backgroundColor: colors, borderRadius: 2 }] },
+    options: { maintainAspectRatio: false,
+      scales: { x: { ticks: { maxTicksLimit: 9 }, grid: { display: false } }, y: { grid: { color: "#161c2b" } } } },
+  });
+}
+
+function closeLegendHtml(byKind) {
+  const items = [
+    ["5m", "l5"], ["15m", "l15"], ["1h", "l1h"], ["4h", "l4h"],
+  ].filter(([k]) => byKind[k]?.length);
+  if (!items.length) return "";
+  return `<span class="close-legend">${items.map(([k, cls]) =>
+    `<span><i class="${cls}"></i>${k} (${byKind[k].length})</span>`).join("")}</span>`;
+}
+
+let currentSession = null;
+
+async function refresh() {
+  try {
+    const q = currentSession ? `?session=${encodeURIComponent(currentSession)}` : "";
+    const r = await fetch("/api/data" + q);
+    const d = await r.json();
+    $("err").style.display = "none";
+    if (d.error) { $("err").textContent = d.error; $("err").style.display = "block"; return; }
+
+    const sel = $("session-sel");
+    if (sel.options.length !== d.sessions.length) {
+      sel.innerHTML = d.sessions.map((s) => `<option value="${s}">${s}</option>`).join("");
+    }
+    sel.value = d.session;
+    currentSession = d.session;
+
+    const age = d.kpis.log_age_sec;
+    const dot = $("live-dot");
+    dot.className = "dot " + (age < 30 ? "live" : age < 300 ? "stale" : "dead");
+    $("live-label").textContent = age < 30 ? "live" : `log ${ago(age)} old`;
+    $("mode-pill").textContent = d.kpis.paper ? "PAPER" : "LIVE";
+    $("mode-pill").style.color = d.kpis.paper ? "var(--amber)" : "var(--green)";
+    $("updated").textContent = "updated " + new Date().toLocaleTimeString([], {hour12: false});
+
+    renderKpis(d.kpis);
+
+    const closeLinesByKind = d.close_lines_by_kind || {};
+    const chartCloseOpts = { closeLinesByKind };
+
+    lineChart("eq-chart", [
+      { label: "equity", data: d.equity_series.map((p) => ({x: p[0], y: p[1]})),
+        borderColor: "#5aa2f7", backgroundColor: "rgba(90,162,247,.08)", fill: true, borderWidth: 1.6, pointRadius: 0, tension: .15 },
+      { label: "exposure", data: d.equity_series.map((p) => ({x: p[0], y: p[2]})),
+        borderColor: "#e8b34b", borderWidth: 1.1, pointRadius: 0, borderDash: [4, 3], tension: .15 },
+    ], { legend: true, ...chartCloseOpts });
+    $("eq-sub").innerHTML = d.equity_series.length
+      ? `${d.equity_series.length} pts${closeLegendHtml(closeLinesByKind)}` : closeLegendHtml(closeLinesByKind);
+
+    const settledFinal = d.settled_series.length ? d.settled_series[d.settled_series.length - 1][1] : 0;
+    const settledNeg = settledFinal < 0;
+    const settledColor = settledNeg ? "#f3655b" : "#2dd4a0";
+    const settledFill = settledNeg ? "rgba(243,101,91,.07)" : "rgba(45,212,160,.07)";
+    lineChart("settled-chart", [
+      { data: d.settled_series.map((p) => ({x: p[0], y: p[1]})),
+        borderColor: settledColor, backgroundColor: settledFill, fill: true, borderWidth: 1.6, pointRadius: 0, stepped: true },
+    ], chartCloseOpts);
+    const settleSub = `${d.kpis.settlements} settlements`;
+    $("settle-sub").innerHTML = `${settleSub}${closeLegendHtml(closeLinesByKind)}`;
+
+    lineChart("spot-chart", [
+      { data: d.spot_series.map((p) => ({x: p[0], y: p[1]})),
+        borderColor: "#a78bfa", borderWidth: 1.4, pointRadius: 0, tension: .15 },
+    ], chartCloseOpts);
+
+    renderFeed(d.feed);
+    renderLegs(d.leg_stats);
+    renderKinds(d.kind_stats);
+    renderPositions(d.positions);
+    renderHist(d.pnl_hist);
+  } catch (e) {
+    $("err").textContent = "dashboard server unreachable: " + e.message;
+    $("err").style.display = "block";
+    $("live-dot").className = "dot dead";
+    $("live-label").textContent = "offline";
+  }
+}
+
+$("session-sel").addEventListener("change", (e) => {
+  currentSession = e.target.value;
+  Object.values(charts).forEach((c) => c.destroy());
+  for (const k in charts) delete charts[k];
+  refresh();
+});
+
+refresh();
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>
