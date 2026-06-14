@@ -7,6 +7,7 @@ import logging
 import os
 import random
 import time
+from collections import deque
 from dataclasses import dataclass, field
 
 import websockets
@@ -17,6 +18,71 @@ from .orderbook import OrderBookFeed
 log = logging.getLogger("exec")
 
 MIN_SHARES = 5.0  # Polymarket minimum order size
+
+
+class FakStats:
+    """Track fill-and-kill outcomes with a rolling window for race-loss monitoring."""
+
+    def __init__(self, min_fill_rate: float = 0.50, min_attempts: int = 10,
+                 window_size: int = 30):
+        self.min_fill_rate = min_fill_rate
+        self.min_attempts = min_attempts
+        self.window_size = window_size
+        self.attempts = 0
+        self.fills = 0
+        self.kills = 0
+        self._recent: deque[bool] = deque(maxlen=window_size)
+
+    def record_fill(self) -> None:
+        self.fills += 1
+        self._recent.append(True)
+
+    def record_kill(self) -> None:
+        self.kills += 1
+        self._recent.append(False)
+
+    def record_attempt(self) -> None:
+        self.attempts += 1
+
+    def session_fill_rate(self) -> float | None:
+        if not self.attempts:
+            return None
+        return self.fills / self.attempts
+
+    def rolling_fill_rate(self) -> float | None:
+        if len(self._recent) < self.min_attempts:
+            return None
+        return sum(self._recent) / len(self._recent)
+
+    def fill_rate(self) -> float | None:
+        """Primary rate for monitoring: rolling window when warm, else session."""
+        return self.rolling_fill_rate() or self.session_fill_rate()
+
+    def should_pause(self) -> bool:
+        rate = self.rolling_fill_rate()
+        return rate is not None and rate < self.min_fill_rate
+
+    def should_resume(self) -> bool:
+        rate = self.rolling_fill_rate()
+        return rate is not None and rate >= self.min_fill_rate
+
+    @property
+    def recent_count(self) -> int:
+        return len(self._recent)
+
+    @property
+    def recent_fills(self) -> int:
+        return sum(self._recent)
+
+    def summary_lines(self) -> list[str]:
+        if not self.attempts:
+            return []
+        sess = 100 * self.fills / self.attempts
+        roll = self.rolling_fill_rate()
+        roll_str = (f", rolling {100 * roll:.0f}% over last {len(self._recent)}"
+                    if roll is not None else "")
+        return [f"  FAK orders: {self.fills}/{self.attempts} filled "
+                f"({sess:.0f}% session{roll_str}, {self.kills} killed)"]
 USER_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/user"
 
 
@@ -241,23 +307,18 @@ class PaperExecutor:
     EPS = 1e-9
 
     def __init__(self, portfolio: Portfolio, feed: OrderBookFeed,
-                 taker_latency_ms: float = 350.0, cancel_latency_ms: float = 150.0):
+                 taker_latency_ms: float = 350.0, cancel_latency_ms: float = 150.0,
+                 fak_min_fill_rate: float = 0.50, fak_min_attempts: int = 10,
+                 fak_window_size: int = 30):
         self.portfolio = portfolio
         self.feed = feed
         self.taker_latency = taker_latency_ms / 1000.0
         self.cancel_latency = cancel_latency_ms / 1000.0
         self.open_orders: dict[str, OpenOrder] = {}
-        self.fak_attempts = 0
-        self.fak_fills = 0
+        self.fak_stats = FakStats(fak_min_fill_rate, fak_min_attempts, fak_window_size)
         self._ids = itertools.count(1)
         feed.on_trade.append(self._on_trade)
-        portfolio.summary_hooks.append(self._summary_lines)
-
-    def _summary_lines(self) -> list[str]:
-        if not self.fak_attempts:
-            return []
-        return [f"  paper FAK orders: {self.fak_fills}/{self.fak_attempts} filled "
-                f"({100 * self.fak_fills / self.fak_attempts:.0f}% won the latency race)"]
+        portfolio.summary_hooks.append(self.fak_stats.summary_lines)
 
     def _fill(self, oid: str, o: OpenOrder, shares: float) -> None:
         o.shares -= shares
@@ -285,17 +346,19 @@ class PaperExecutor:
                            price: float, shares: float, leg: str) -> None:
         """Taker order arrives at the book after a simulated round trip; fill
         only with whatever is still offered at our price when it gets there."""
-        self.fak_attempts += 1
+        self.fak_stats.record_attempt()
         await asyncio.sleep(self.taker_latency * random.uniform(0.5, 1.5))
         if market.close_ts <= time.time():
+            self.fak_stats.record_kill()
             return  # window closed while the order was in flight
         book = self.feed.books.get(token)
         ask = book.best_ask() if book else None
         if not ask or ask[0] > price + self.EPS or ask[1] <= 0:
+            self.fak_stats.record_kill()
             log.info("paper FAK killed: %s %s, ask gone from %.3f (lost the race)",
                      market.title, outcome.upper(), price)
             return
-        self.fak_fills += 1
+        self.fak_stats.record_fill()
         self.portfolio.on_fill(market, outcome, ask[0], min(shares, ask[1]),
                                taker=True, leg=leg)
 
@@ -345,7 +408,8 @@ class LiveExecutor:
 
     def __init__(self, portfolio: Portfolio, host: str, chain_id: int,
                  private_key: str, funder: str, signature_type: int,
-                 onchain=None):
+                 onchain=None, fak_min_fill_rate: float = 0.50,
+                 fak_min_attempts: int = 10, fak_window_size: int = 30):
         from py_clob_client.client import ClobClient
 
         self.portfolio = portfolio
@@ -355,6 +419,8 @@ class LiveExecutor:
         )
         self.client.set_api_creds(self.client.create_or_derive_api_creds())
         self.open_orders: dict[str, OpenOrder] = {}
+        self.fak_stats = FakStats(fak_min_fill_rate, fak_min_attempts, fak_window_size)
+        self._fak_filled: dict[str, bool] = {}  # order_id -> got any taker fill
         self._seen_trades: set[str] = set()
         self.onchain = onchain
         self._merge_queue: dict[str, Market] = {}   # condition_id -> market
@@ -364,6 +430,7 @@ class LiveExecutor:
         if onchain is not None:
             portfolio.merge_hook = lambda market, pairs: self._merge_queue.setdefault(
                 market.condition_id, market)
+        portfolio.summary_hooks.append(self.fak_stats.summary_lines)
         log.info("live executor ready (funder %s...)", funder[:10])
 
     def track_markets(self, condition_ids: set[str]) -> None:
@@ -419,11 +486,23 @@ class LiveExecutor:
         if oid:
             self.open_orders[oid] = OpenOrder(oid, market, outcome, token, price, shares, leg=leg)
             if order_type != OrderType.GTC:
+                self.fak_stats.record_attempt()
+                self._fak_filled[oid] = False
                 # FAK orders never rest; keep the entry just long enough for
                 # the user-feed trade event to attribute the fill, then drop it
                 asyncio.get_running_loop().call_later(
-                    30.0, lambda: self.open_orders.pop(oid, None))
+                    30.0, lambda o=oid: self._resolve_fak(o))
         return oid
+
+    def _resolve_fak(self, order_id: str) -> None:
+        """Count zero-fill FAK orders as race losses once the fill window closes."""
+        o = self.open_orders.pop(order_id, None)
+        filled = self._fak_filled.pop(order_id, False)
+        if o is None or filled:
+            return
+        self.fak_stats.record_kill()
+        log.info("live FAK killed: %s %s @ %.3f (lost the race)",
+                 o.market.title, o.outcome.upper(), o.price)
 
     async def cancel(self, order_id: str) -> None:
         try:
@@ -459,6 +538,9 @@ class LiveExecutor:
             # we may be the taker...
             taker_oid = d.get("taker_order_id")
             if taker_oid in self.open_orders:
+                if not self._fak_filled.get(taker_oid):
+                    self._fak_filled[taker_oid] = True
+                    self.fak_stats.record_fill()
                 price = float(d.get("price", 0))
                 size = float(d.get("size", 0))
                 # FEE VERIFICATION: docs say fee = 0.07*p*(1-p)/share (what the

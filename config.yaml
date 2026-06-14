@@ -207,13 +207,11 @@ guards:
   markout_horizons_sec: [10, 60]
 
 risk:
-  max_total_exposure_usd: 500  # global cap on open cost basis
-  kill_switch_loss_usd: 300    # stop trading if equity drops this far below the
-                               # *session start* equity (not all-time start cash:
-                               # banked profit must not raise the pain threshold).
-                               # Raised from 200: snipe pnl is fat-tailed (51% of
-                               # markets net-positive, top-10 markets ~half the
-                               # profit) — too tight a switch stops out of variance
+  max_total_exposure_usd: 500  # base exposure cap; scales with equity up to ceiling
+  max_total_exposure_ceiling: 500  # hard book ceiling (never exceed even when scaled up)
+  kill_switch_loss_usd: 300    # floor: minimum absolute session drawdown stop
+  kill_switch_loss_frac: 0.30 # session drawdown stop = this fraction of session-start equity
+  kill_switch_loss_cap_usd: 500  # ceiling on the proportional kill limit
   max_feed_age_sec: 5          # pull all quotes if the price feed stalls this long
   vol_warmup_sec: 90           # no sniper/scalper trades until the vol EWMA has
                                # this many seconds of samples. At cold start vol
@@ -222,6 +220,35 @@ risk:
                                # around the candle open read as 11-14c edges on
                                # BOTH sides in sequence (session 1781248550:
                                # -$67 in the first 14 seconds of the session)
+
+sizing:
+  # Bidirectional equity scaling: sqrt grows with profits, shrinks on drawdown.
+  # Exposure scales the same way, capped at risk.max_total_exposure_ceiling.
+  enabled: true
+  mode: sqrt                   # sqrt(equity/ref) or step at equity_tiers
+  reference_equity: 1000       # defaults to paper.starting_cash if omitted
+  min_scale: 0.5               # never shrink below 50% of base caps on drawdown
+  equity_tiers: [2500, 5000, 10000]   # step mode only
+  tier_multipliers: [1.0, 1.25, 1.5, 2.0]  # below $2.5k, then each tier
+  max_take_usd_cap: 500        # absolute ceiling on scaled snipe/scalp takes
+  max_position_usd_cap: 500    # absolute ceiling on per-market snipe cost
+  scale_exposure: true         # scale max_total_exposure_usd with equity scale
+
+fak_monitor:
+  # Graduated race-loss response: adjust live first, pause only when severe.
+  enabled: true
+  mode: graduated              # graduated | adjust | pause
+  min_fill_rate: 0.50          # tier 1: soft compression (proportional size cut)
+  hard_fill_rate: 0.40         # tier 2: hard compression (0.5x size, tighter edge)
+  pause_fill_rate: 0.30        # tier 3: pause takers (graduated mode only)
+  min_attempts: 10             # need this many outcomes in the rolling window
+  window_size: 30
+  min_edge_bump: 0.02          # tier 1: raise sniper min_edge by this
+  hard_size_mult: 0.5          # tier 2: force this size multiplier
+  snipe_cooldown_sec: 10       # base snipe cooldown (tier 1)
+  hard_snipe_cooldown_sec: 20  # tier 2 snipe cooldown
+  scalp_cooldown_sec: 15       # base scalp cooldown (tier 1)
+  revert_scaling_on_stress: true  # revert equity scaling at tier 1+
 
 paper:
   starting_cash: 1000

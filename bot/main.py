@@ -99,6 +99,9 @@ async def amain(args: argparse.Namespace) -> None:
             funder=creds["funder"],
             signature_type=sig_type,
             onchain=onchain,
+            fak_min_fill_rate=cfg.get("fak_monitor", "min_fill_rate", default=0.50),
+            fak_min_attempts=cfg.get("fak_monitor", "min_attempts", default=10),
+            fak_window_size=cfg.get("fak_monitor", "window_size", default=30),
         )
         tasks.append(executor.run_user_feed())
         tasks.append(executor.process_onchain())
@@ -108,6 +111,9 @@ async def amain(args: argparse.Namespace) -> None:
             portfolio, feed,
             taker_latency_ms=cfg.get("paper", "taker_latency_ms", default=350),
             cancel_latency_ms=cfg.get("paper", "cancel_latency_ms", default=150),
+            fak_min_fill_rate=cfg.get("fak_monitor", "min_fill_rate", default=0.50),
+            fak_min_attempts=cfg.get("fak_monitor", "min_attempts", default=10),
+            fak_window_size=cfg.get("fak_monitor", "window_size", default=30),
         )
         log.info("paper mode: simulated fills against live books "
                  "(taker latency %.0fms, cancel latency %.0fms)",

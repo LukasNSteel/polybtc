@@ -44,6 +44,13 @@ class Strategy:
         self._session_start_equity: float | None = None
         self._last_status = 0.0
         self._last_calib = 0.0
+        self._fak_tier = 0  # 0=ok, 1=soft adjust, 2=hard adjust, 3=paused
+        self._fak_adjustments: dict = {
+            "size_mult": 1.0, "min_edge_bump": 0.0,
+            "snipe_cooldown_sec": 10, "scalp_cooldown_sec": 15,
+        }
+        self._scaling_reverted = False
+        self._size_caps_cache: dict | None = None
         log_dir = cfg.get("log_dir", default="logs")
         os.makedirs(log_dir, exist_ok=True)
         self._calib_path = os.path.join(log_dir, "calibration.csv")
@@ -111,8 +118,188 @@ class Strategy:
         return True
 
     def _exposure_ok(self, extra_usd: float) -> bool:
-        cap = self.cfg.get("risk", "max_total_exposure_usd", default=500)
+        if self._size_caps_cache and "max_exposure_usd" in self._size_caps_cache:
+            cap = self._size_caps_cache["max_exposure_usd"]
+        else:
+            cap = self.cfg.get("risk", "max_total_exposure_usd", default=500)
         return self.portfolio.exposure() + extra_usd <= cap
+
+    def _equity_scale(self, equity: float) -> tuple[float, str]:
+        """Bidirectional scale: grows with profits, shrinks on drawdown."""
+        s = self.cfg.get("sizing", default={}) or {}
+        ref = s.get("reference_equity") or self.portfolio.start_cash
+        min_scale = s.get("min_scale", 0.5)
+        mode = s.get("mode", "sqrt")
+        if self._scaling_reverted:
+            return 1.0, f"{mode}-reverted"
+
+        if mode == "step":
+            tiers = s.get("equity_tiers", [2500, 5000, 10000])
+            mults = s.get("tier_multipliers", [1.0, 1.25, 1.5, 2.0])
+            scale = mults[0]
+            for i, tier in enumerate(tiers):
+                if equity >= tier:
+                    scale = mults[min(i + 1, len(mults) - 1)]
+            if equity < ref:
+                scale = min(scale, math.sqrt(max(equity, 1) / ref))
+        else:
+            scale = math.sqrt(max(equity, 1) / ref)
+        return max(min_scale, scale), mode
+
+    def _exposure_cap(self, scale: float) -> float:
+        risk = self.cfg.get("risk", default={}) or {}
+        base = risk.get("max_total_exposure_usd", 500)
+        s = self.cfg.get("sizing", default={}) or {}
+        if not s.get("enabled", False) or not s.get("scale_exposure", True):
+            return base
+        ceiling = risk.get("max_total_exposure_ceiling", base)
+        return min(base * scale, ceiling)
+
+    def _kill_limit(self) -> float:
+        """Session drawdown stop: proportional to start equity, floored and capped."""
+        risk = self.cfg.get("risk", default={}) or {}
+        floor_usd = risk.get("kill_switch_loss_usd", 300)
+        frac = risk.get("kill_switch_loss_frac", 0.30)
+        cap_usd = risk.get("kill_switch_loss_cap_usd", 500)
+        if self._session_start_equity is None:
+            return floor_usd
+        pct_limit = self._session_start_equity * frac
+        return min(max(pct_limit, floor_usd), cap_usd)
+
+    def _size_caps(self, equity: float) -> dict:
+        """Scale per-trade and exposure caps with equity (sqrt or step-ups)."""
+        sn = self.cfg.get("sniper", default={}) or {}
+        sc = self.cfg.get("scalper", default={}) or {}
+        base = {
+            "max_take_usd": sn.get("max_take_usd", 100),
+            "max_position_usd": sn.get("max_position_usd", 150),
+            "max_scalp_usd": sc.get("max_usd", 100),
+            "scale": 1.0,
+            "mode": "fixed",
+            "max_exposure_usd": self.cfg.get("risk", "max_total_exposure_usd", default=500),
+        }
+        s = self.cfg.get("sizing", default={}) or {}
+        if not s.get("enabled", False):
+            return base
+
+        scale, mode = self._equity_scale(equity)
+        take_ceil = s.get("max_take_usd_cap", 500)
+        pos_ceil = s.get("max_position_usd_cap", 500)
+        fak_mult = self._fak_adjustments.get("size_mult", 1.0)
+        eff_scale = scale * fak_mult
+
+        return {
+            "max_take_usd": min(base["max_take_usd"] * eff_scale, take_ceil),
+            "max_position_usd": min(base["max_position_usd"] * eff_scale, pos_ceil),
+            "max_scalp_usd": min(base["max_scalp_usd"] * eff_scale, take_ceil),
+            "max_exposure_usd": self._exposure_cap(eff_scale),
+            "scale": scale,
+            "fak_mult": fak_mult,
+            "fak_tier": self._fak_tier,
+            "mode": mode,
+        }
+
+    def _fak_tier_for_rate(self, rate: float, mode: str, fm: dict) -> int:
+        soft = fm.get("min_fill_rate", 0.50)
+        hard = fm.get("hard_fill_rate", 0.40)
+        pause_at = fm.get("pause_fill_rate", 0.30)
+        if rate >= soft:
+            return 0
+        if mode == "pause":
+            return 3
+        if mode == "adjust":
+            return 2 if rate < hard else 1
+        # graduated: soft adjust → hard adjust → pause
+        if rate < pause_at:
+            return 3
+        if rate < hard:
+            return 2
+        return 1
+
+    def _fak_adjustments_for_tier(self, tier: int, rate: float, fm: dict) -> dict:
+        soft = fm.get("min_fill_rate", 0.50)
+        bump = fm.get("min_edge_bump", 0.02)
+        hard_mult = fm.get("hard_size_mult", 0.5)
+        snipe_cd = fm.get("snipe_cooldown_sec", 10)
+        hard_snipe_cd = fm.get("hard_snipe_cooldown_sec", 20)
+        scalp_cd = fm.get("scalp_cooldown_sec", 15)
+        if tier == 0:
+            return {
+                "size_mult": 1.0, "min_edge_bump": 0.0,
+                "snipe_cooldown_sec": snipe_cd, "scalp_cooldown_sec": scalp_cd,
+            }
+        if tier == 1:
+            return {
+                "size_mult": rate / soft,
+                "min_edge_bump": bump,
+                "snipe_cooldown_sec": snipe_cd, "scalp_cooldown_sec": scalp_cd,
+            }
+        if tier == 2:
+            return {
+                "size_mult": hard_mult,
+                "min_edge_bump": bump * 2,
+                "snipe_cooldown_sec": hard_snipe_cd,
+                "scalp_cooldown_sec": scalp_cd * 2,
+            }
+        return {
+            "size_mult": 0.0, "min_edge_bump": 0.0,
+            "snipe_cooldown_sec": snipe_cd, "scalp_cooldown_sec": scalp_cd,
+        }
+
+    def _log_fak_tier_change(self, old: int, new: int, rate: float,
+                             fak, fm: dict) -> None:
+        roll_n = fak.recent_count
+        mode = fm.get("mode", "graduated")
+        labels = {0: "normal", 1: "soft adjust", 2: "hard adjust", 3: "paused"}
+        if new > old:
+            level = log.error if new >= 3 else log.warning
+            action = {
+                1: f"revert scaling, size {rate / fm.get('min_fill_rate', 0.50):.2f}x, "
+                   f"min_edge +{fm.get('min_edge_bump', 0.02):.2f}",
+                2: f"size {fm.get('hard_size_mult', 0.5):.2f}x, min_edge +"
+                   f"{fm.get('min_edge_bump', 0.02) * 2:.2f}, slower snipes",
+                3: "pausing taker legs",
+            }.get(new, "")
+            level(
+                "FAK STRESS tier %d→%d (%s): rolling %.0f%% over %d "
+                "(session %d/%d) — %s",
+                old, new, labels[new], rate * 100, roll_n,
+                fak.fills, fak.attempts, action,
+            )
+        else:
+            log.warning(
+                "FAK RECOVERED tier %d→%d (%s): rolling %.0f%% over %d — %s",
+                old, new, labels[new], rate * 100, roll_n,
+                "restoring equity scaling" if new == 0 and (
+                    fm.get("revert_scaling_on_stress",
+                            fm.get("revert_scaling_on_pause", True))) else "easing limits",
+            )
+
+    def _check_fak_monitor(self) -> None:
+        fak = getattr(self.exec, "fak_stats", None)
+        fm = self.cfg.get("fak_monitor", default={}) or {}
+        if fak is None or not fm.get("enabled", True):
+            return
+
+        roll = fak.rolling_fill_rate()
+        if roll is None:
+            return
+
+        mode = fm.get("mode", "graduated")
+        revert = fm.get("revert_scaling_on_stress",
+                         fm.get("revert_scaling_on_pause", True))
+        new_tier = self._fak_tier_for_rate(roll, mode, fm)
+        old_tier = self._fak_tier
+
+        if new_tier != old_tier:
+            self._fak_tier = new_tier
+            if new_tier >= 1 and revert:
+                self._scaling_reverted = True
+            elif new_tier == 0:
+                self._scaling_reverted = False
+            self._log_fak_tier_change(old_tier, new_tier, roll, fak, fm)
+
+        self._fak_adjustments = self._fak_adjustments_for_tier(self._fak_tier, roll, fm)
 
     def _position_cost(self, slug: str) -> float:
         p = self.portfolio.positions.get(slug)
@@ -265,7 +452,8 @@ class Strategy:
                 if oid:
                     state[side] = (oid, want)
 
-    async def _snipe(self, m: Market, p_up: float, p_lo: float, p_hi: float) -> None:
+    async def _snipe(self, m: Market, p_up: float, p_lo: float, p_hi: float,
+                     caps: dict) -> None:
         """Taker leg. Gated on the DUAL-BETA ROBUST edge: the entry must clear
         min_edge under both the mean-reversion (beta~0.83) and momentum
         (beta~1.36) calibrations of the distance model, so it only fires on
@@ -284,10 +472,12 @@ class Strategy:
         (predicted 0.35 -> realized 0.45). We only trade lag in magnitude,
         never sign."""
         c = self.cfg["sniper"]
-        if not c["enabled"] or not self._tradable(m) or not self._vol_warm():
+        if (not c["enabled"] or not self._tradable(m) or not self._vol_warm()
+                or self._fak_tier >= 3):
             return
-        per_mkt_cap = c.get("max_position_usd",
-                            self.cfg.get("market_maker", "max_position_usd", default=150))
+        per_mkt_cap = caps["max_position_usd"]
+        min_edge = c["min_edge"] + self._fak_adjustments.get("min_edge_bump", 0.0)
+        snipe_cd = self._fak_adjustments.get("snipe_cooldown_sec", 10)
         imbalance = self._inventory_imbalance(m, p_up, cap=per_mkt_cap)
         max_inv = c.get("max_inventory_frac", 0.25)
         pos = self.portfolio.positions.get(m.slug)
@@ -339,21 +529,21 @@ class Strategy:
                     log.info("SNIPE VETO %s %s: edge %.3f exceeds max_edge %.2f",
                              m.title, side.upper(), net_edge, max_edge)
                 continue
-            if net_edge > c["min_edge"]:
+            if net_edge > min_edge:
                 # size proportional to conviction: full size at 2x min_edge
-                conviction = min(1.0, net_edge / (2 * c["min_edge"]))
-                usd = min(c["max_take_usd"] * max(0.25, conviction), ask_px * ask_sz)
+                conviction = min(1.0, net_edge / (2 * min_edge))
+                usd = min(caps["max_take_usd"] * max(0.25, conviction), ask_px * ask_sz)
                 shares = max(usd / ask_px, MIN_SHARES)
                 if (self._exposure_ok(usd)
                         and self._position_cost(m.slug) + usd <= per_mkt_cap
-                        and self._cooled(m.slug, "snipe", side, 10)):
+                        and self._cooled(m.slug, "snipe", side, snipe_cd)):
                     log.info("SNIPE %s %s: ask %.3f + fee %.4f vs robust %.3f "
                              "(blend %.3f, edge %.3f, $%.0f)",
                              m.title, side.upper(), ask_px, fee, robust, fair,
                              net_edge, usd)
                     await self.exec.place_buy(m, side, ask_px, shares, leg="snipe")
 
-    async def _scalp(self, m: Market, p_up: float) -> None:
+    async def _scalp(self, m: Market, p_up: float, caps: dict) -> None:
         c = self.cfg["scalper"]
         # only the kinds where late high-price buys tested +EV: 1h +2.2%/$1
         # (14/15 days green), 15m mildly positive; 5m tested NEGATIVE
@@ -366,8 +556,10 @@ class Strategy:
         # override because the study's best 15m scalp bucket is tau 5-30s
         min_tau = c.get(f"min_tau_sec_{m.kind}", c.get("min_tau_sec", 0))
         if (not c["enabled"] or not self._tradable(m) or not self._vol_warm()
+                or self._fak_tier >= 3
                 or m.t_remaining > c["window_sec"] or m.t_remaining <= min_tau):
             return
+        scalp_cd = self._fak_adjustments.get("scalp_cooldown_sec", 15)
         for side, fair, token in (("up", p_up, m.token_up), ("dn", 1 - p_up, m.token_down)):
             if fair < c["min_prob"]:
                 continue
@@ -386,9 +578,9 @@ class Strategy:
                 continue  # fee eats the scalp
             if not self._book_fresh(token):
                 continue
-            usd = min(c["max_usd"], ask[0] * ask[1])
+            usd = min(caps["max_scalp_usd"], ask[0] * ask[1])
             shares = max(usd / ask[0], MIN_SHARES)
-            if self._exposure_ok(usd) and self._cooled(m.slug, "scalp", side, 15):
+            if self._exposure_ok(usd) and self._cooled(m.slug, "scalp", side, scalp_cd):
                 log.info("SCALP %s %s @ %.3f (fair %.4f, %.0fs left)",
                          m.title, side.upper(), ask[0], fair, m.t_remaining)
                 await self.exec.place_buy(m, side, ask[0], shares, leg="scalp")
@@ -470,6 +662,7 @@ class Strategy:
         mom_clamp = fv.get("momentum_clamp_sigma", 1.5)
         r_recent = self.binance.recent_return(mom_window) if mom_beta > 0 else None
         marks: dict[str, float] = {}
+        mark_rows: list[tuple[Market, float, float, float]] = []
         for m in list(self.markets.active.values()):
             if m.open_ts > now:
                 continue  # next window tracked early; its candle hasn't opened yet
@@ -504,17 +697,28 @@ class Strategy:
             )
             marks[m.slug] = p_up
             self._model_marks[m.slug] = model_p
+            mark_rows.append((m, p_up, p_lo, p_hi))
+
+        equity = self.portfolio.equity(marks)
+        self._check_fak_monitor()
+        caps = self._size_caps(equity)
+        self._size_caps_cache = caps
+
+        for m, p_up, p_lo, p_hi in mark_rows:
             await self._market_make(m, p_up)
-            await self._snipe(m, p_up, p_lo, p_hi)
-            await self._scalp(m, p_up)
+            await self._snipe(m, p_up, p_lo, p_hi, caps)
+            await self._scalp(m, p_up, caps)
 
         await self._settle_expired()
-
         equity = self.portfolio.equity(marks)
         if self._session_start_equity is None:
             self._session_start_equity = equity
-            log.info("session baseline equity $%.2f (kill switch is relative to this)", equity)
-        kill = self.cfg.get("risk", "kill_switch_loss_usd", default=200)
+            log.info("session baseline equity $%.2f (kill switch %.0f%% capped $%.0f–$%.0f)",
+                     equity,
+                     100 * self.cfg.get("risk", "kill_switch_loss_frac", default=0.30),
+                     self.cfg.get("risk", "kill_switch_loss_usd", default=300),
+                     self.cfg.get("risk", "kill_switch_loss_cap_usd", default=500))
+        kill = self._kill_limit()
         if equity - self._session_start_equity < -kill:
             self._kill_count += 1
             log.error("KILL SWITCH: equity $%.2f, down $%.2f this session (limit $%.0f). "
@@ -556,10 +760,33 @@ class Strategy:
             if self.binance.coinbase_basis is not None:
                 extras.append(f"cb basis {self.binance.coinbase_basis:+.1f}")
             suffix = f" ({', '.join(extras)})" if extras else ""
+            cap_bits = []
+            if self._size_caps_cache:
+                c = self._size_caps_cache
+                cap_bits.append(f"scale {c['scale']:.2f}x ({c['mode']})")
+                if c.get("fak_mult", 1.0) != 1.0:
+                    cap_bits.append(f"fak {c['fak_mult']:.2f}x")
+                cap_bits.append(f"take ${c['max_take_usd']:.0f}")
+                cap_bits.append(f"exp ${c['max_exposure_usd']:.0f}")
+            fak = getattr(self.exec, "fak_stats", None)
+            if fak and fak.attempts:
+                roll = fak.rolling_fill_rate()
+                if roll is not None:
+                    tier = self._fak_tier
+                    tier_str = f" t{tier}" if tier else ""
+                    cap_bits.append(f"FAK {100 * roll:.0f}%/{fak.recent_count}{tier_str}")
+                else:
+                    cap_bits.append(f"FAK {100 * fak.fills / fak.attempts:.0f}%")
+            if self._fak_tier >= 3:
+                cap_bits.append("takers PAUSED")
+            elif self._fak_tier >= 1:
+                cap_bits.append(f"takers ADJUST t{self._fak_tier}")
+            cap_str = f" | {' | '.join(cap_bits)}" if cap_bits else ""
             log.info(
-                "spot %.1f%s | vol(1m) %.3f%% | markets %d [%s] | cash $%.2f | equity $%.2f | exposure $%.2f | open orders %d",
+                "spot %.1f%s | vol(1m) %.3f%% | markets %d [%s] | cash $%.2f | equity $%.2f | exposure $%.2f | open orders %d%s",
                 spot, suffix,
                 vol_1m, len(self.markets.active), " ".join(fair_strs),
                 self.portfolio.cash, equity, self.portfolio.exposure(),
                 len(getattr(self.exec, "open_orders", {})),
+                cap_str,
             )
