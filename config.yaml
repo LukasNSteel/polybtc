@@ -252,13 +252,19 @@ fak_monitor:
 
 paper:
   starting_cash: 1000
-  # execution realism. Taker (snipe/scalp) orders resolve after a simulated
-  # round trip (+-50% jitter) against whatever the book shows *then* — if the
-  # stale ask is gone, the order kills, like losing the race to a faster bot.
-  # Cancels also stay hittable while "in flight". Set both to 0 to restore
-  # instant (optimistic) fills.
-  taker_latency_ms: 350
-  cancel_latency_ms: 150
+  # execution realism. Taker (snipe/scalp) orders model the itode speed-bump
+  # mechanism: total tick-to-trade budget is taker_latency_ms (Binance-Tokyo
+  # signal travel + Dublin decide/submit + the mandatory speed bump). The last
+  # speed_bump_ms of that budget is a FROZEN, UNCANCELLABLE hold — once the
+  # order is submitted it is committed for the whole bump, cannot be pulled,
+  # and is re-validated against the book only at the END of the hold. If the
+  # side richened during the hold (BTC moved in our favour) the cheap quote is
+  # gone and the FAK is rejected; if it cheapened (BTC moved against us) we are
+  # committed and filled anyway — adverse selection. Set taker_latency_ms 0 to
+  # restore instant (optimistic) fills.
+  taker_latency_ms: 400      # max identified tick-to-trade budget (was 350)
+  speed_bump_ms: 250         # mandatory uncancellable itode hold (subset of the budget)
+  cancel_latency_ms: 150     # applies to resting MM (GTC) quotes only
 
 live:
   # secrets come from environment variables, never from this file:

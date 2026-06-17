@@ -109,15 +109,18 @@ async def amain(args: argparse.Namespace) -> None:
     else:
         executor = PaperExecutor(
             portfolio, feed,
-            taker_latency_ms=cfg.get("paper", "taker_latency_ms", default=350),
+            taker_latency_ms=cfg.get("paper", "taker_latency_ms", default=400),
+            speed_bump_ms=cfg.get("paper", "speed_bump_ms", default=250),
             cancel_latency_ms=cfg.get("paper", "cancel_latency_ms", default=150),
             fak_min_fill_rate=cfg.get("fak_monitor", "min_fill_rate", default=0.50),
             fak_min_attempts=cfg.get("fak_monitor", "min_attempts", default=10),
             fak_window_size=cfg.get("fak_monitor", "window_size", default=30),
         )
         log.info("paper mode: simulated fills against live books "
-                 "(taker latency %.0fms, cancel latency %.0fms)",
-                 executor.taker_latency * 1000, executor.cancel_latency * 1000)
+                 "(taker latency %.0fms incl. %.0fms uncancellable speed bump, "
+                 "cancel latency %.0fms)",
+                 executor.taker_latency * 1000, executor.speed_bump * 1000,
+                 executor.cancel_latency * 1000)
 
     strategy = Strategy(cfg, binance, markets, feed, executor, portfolio,
                         paper=not args.live)

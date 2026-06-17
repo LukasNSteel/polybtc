@@ -243,15 +243,22 @@ are charged the dynamic fee in the bot's accounting.
   candle**. The bot uses Binance as fair-value proxy for all — fine for
   cents-wide edges, but borderline end-of-window scalps on 5m/15m markets
   carry basis risk.
-- **Paper fills model queue position and latency but are still approximate.**
-  A resting bid only fills after the size displayed ahead of it at that level
-  is consumed; trades through the level fill fully. Taker (snipe/scalp) orders
-  resolve after a simulated round trip (`paper.taker_latency_ms`, ±50% jitter)
-  against the book as it stands *then* — if the stale ask vanished in flight,
-  the order kills, like losing the race to a faster bot. Cancels stay hittable
-  while in flight (`paper.cancel_latency_ms`). The session summary reports the
-  FAK fill rate. Hidden/iceberg flow and cancellations ahead of us still
-  aren't modeled — discount paper PnL somewhat.
+- **Paper fills model queue position and the itode speed bump but are still
+  approximate.** A resting bid only fills after the size displayed ahead of it
+  at that level is consumed; trades through the level fill fully. Taker
+  (snipe/scalp) orders model Polymarket's speed bump, not a cancellable race:
+  the order is committed for the full tick-to-trade budget
+  (`paper.taker_latency_ms`, default 400ms — the max identified latency), whose
+  last `paper.speed_bump_ms` (250ms) is a **frozen, uncancellable hold**. We
+  re-validate against the book only at the *end* of the hold — if the side
+  richened (BTC moved our way) the cheap quote is gone and the FAK is rejected;
+  if it cheapened (BTC moved against us) we are committed and filled anyway, an
+  **adverse-selection** fill the old race model was blind to. There is no
+  cancel escape during the hold (a jump-guard pull on a committed order is
+  ignored). Resting GTC quotes are still genuinely cancellable
+  (`paper.cancel_latency_ms`). The session summary reports the FAK fill rate
+  and the adverse-fill count/cost. Hidden/iceberg flow and cancellations ahead
+  of us still aren't modeled — discount paper PnL somewhat.
 - **Auto merge/redeem needs an EOA wallet** (`signature_type: 0`); proxy
   accounts must merge/redeem via the Polymarket UI. Paper mode settles
   automatically either way.

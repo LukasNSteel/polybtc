@@ -31,11 +31,22 @@ class FakStats:
         self.attempts = 0
         self.fills = 0
         self.kills = 0
+        # paper speed-bump model: fills taken while the side drifted against us
+        # during the uncancellable hold (adverse selection the old race model
+        # was blind to). adverse_drift sums the |fair move| we ate on those.
+        self.adverse_fills = 0
+        self.adverse_drift = 0.0
         self._recent: deque[bool] = deque(maxlen=window_size)
 
     def record_fill(self) -> None:
         self.fills += 1
         self._recent.append(True)
+
+    def record_adverse(self, drift: float) -> None:
+        """A fill taken while the underlying drifted against us during the
+        250ms uncancellable hold. drift is the adverse fair-value move (>0)."""
+        self.adverse_fills += 1
+        self.adverse_drift += drift
 
     def record_kill(self) -> None:
         self.kills += 1
@@ -81,8 +92,15 @@ class FakStats:
         roll = self.rolling_fill_rate()
         roll_str = (f", rolling {100 * roll:.0f}% over last {len(self._recent)}"
                     if roll is not None else "")
-        return [f"  FAK orders: {self.fills}/{self.attempts} filled "
-                f"({sess:.0f}% session{roll_str}, {self.kills} killed)"]
+        lines = [f"  FAK orders: {self.fills}/{self.attempts} filled "
+                 f"({sess:.0f}% session{roll_str}, {self.kills} killed)"]
+        if self.adverse_fills:
+            avg = self.adverse_drift / self.adverse_fills
+            lines.append(
+                f"    of which {self.adverse_fills} adverse-selection fills "
+                f"(filled while fair drifted against us during the 250ms hold, "
+                f"avg {avg:.3f} / {100 * avg:.1f}c per share)")
+        return lines
 USER_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/user"
 
 
@@ -288,37 +306,66 @@ class Portfolio:
 
 class PaperExecutor:
     """Simulates fills against the live order book with queue-position modeling
-    and order round-trip latency.
+    and the itode speed-bump execution mechanism.
 
-    Taker (snipe/scalp, FAK): the order "arrives" after a simulated latency and
-    only fills if the ask still exists at our price *then*, with whatever size
-    is displayed then. Sniping stale quotes is a latency race — instant fills
-    against our own book snapshot would credit us a 100% win rate on exactly
-    the fleeting quotes that faster bots (or the owner's cancel) take in
-    reality.
+    Taker (snipe/scalp, FAK): models Polymarket's speed bump, NOT a cancellable
+    latency race. On submission the order is committed for the full tick-to-
+    trade budget (taker_latency); the last speed_bump portion is a FROZEN,
+    UNCANCELLABLE hold. We re-validate against the book only at the END of the
+    hold:
+      * if the side richened during the hold (BTC moved in our favour) the
+        cheap quote is gone above our limit -> the FAK is rejected (a costless
+        miss; faster takers got the print);
+      * if the side cheapened (BTC moved against us) we are committed and get
+        filled anyway, at a now-worse fair value -> adverse selection.
+    The old model treated every close call as a costless "lost the race" kill,
+    which understated adverse selection and credited cancels that do not exist
+    live. There is no cancel escape during the hold.
     Maker: when we place a resting bid, the size already displayed at that
     price level is queued ahead of us. Trades through our level (strictly
     lower price) fill us fully; trades *at* our level first burn through the
     queue ahead, then fill us partially with whatever size remains. Cancels
-    take effect after the same latency, so quotes stay hittable during a jump
-    just like live cancels in flight.
+    take effect after cancel_latency (GTC quotes are genuinely cancellable,
+    unlike the marketable taker orders above).
     """
 
     EPS = 1e-9
 
     def __init__(self, portfolio: Portfolio, feed: OrderBookFeed,
-                 taker_latency_ms: float = 350.0, cancel_latency_ms: float = 150.0,
+                 taker_latency_ms: float = 400.0, speed_bump_ms: float = 250.0,
+                 cancel_latency_ms: float = 150.0,
                  fak_min_fill_rate: float = 0.50, fak_min_attempts: int = 10,
                  fak_window_size: int = 30):
         self.portfolio = portfolio
         self.feed = feed
         self.taker_latency = taker_latency_ms / 1000.0
+        # the uncancellable hold is a subset of the total tick-to-trade budget;
+        # the rest is signal travel + Dublin decide/submit (the controllable bit)
+        self.speed_bump = min(speed_bump_ms / 1000.0, self.taker_latency)
         self.cancel_latency = cancel_latency_ms / 1000.0
         self.open_orders: dict[str, OpenOrder] = {}
+        # taker orders frozen inside the speed bump: cannot be cancelled
+        self._committed: set[str] = set()
         self.fak_stats = FakStats(fak_min_fill_rate, fak_min_attempts, fak_window_size)
         self._ids = itertools.count(1)
         feed.on_trade.append(self._on_trade)
         portfolio.summary_hooks.append(self.fak_stats.summary_lines)
+
+    def _mid(self, token: str) -> float | None:
+        """Book mid for a token — our observable proxy for the market's fair
+        P(side). Its move during the hold is the BTC drift priced in."""
+        book = self.feed.books.get(token)
+        if not book:
+            return None
+        bid = book.best_bid()
+        ask = book.best_ask()
+        if bid and ask:
+            return (bid[0] + ask[0]) / 2.0
+        if ask:
+            return ask[0]
+        if bid:
+            return bid[0]
+        return None
 
     def _fill(self, oid: str, o: OpenOrder, shares: float) -> None:
         o.shares -= shares
@@ -342,23 +389,64 @@ class PaperExecutor:
                 if rem > 0:
                     self._fill(oid, o, min(rem, o.shares))
 
-    async def _delayed_fak(self, market: Market, outcome: str, token: str,
-                           price: float, shares: float, leg: str) -> None:
-        """Taker order arrives at the book after a simulated round trip; fill
-        only with whatever is still offered at our price when it gets there."""
+    async def _speed_bump_fill(self, oid: str, market: Market, outcome: str,
+                               token: str, price: float, shares: float,
+                               leg: str) -> None:
+        """Model the itode speed bump rather than a cancellable race.
+
+        Timeline: the controllable portion (signal travel + Dublin decide/
+        submit) elapses first, then the order enters a fixed, uncancellable
+        hold (speed_bump). During the hold the order is committed — no cancel
+        can pull it. At the end of the hold we re-validate against the book:
+          * side richened (moved in our favour) -> cheap quote gone, rejected;
+          * side cheapened (moved against us)   -> committed fill, adverse.
+        """
         self.fak_stats.record_attempt()
-        await asyncio.sleep(self.taker_latency * random.uniform(0.5, 1.5))
+        pre_bump = max(0.0, self.taker_latency - self.speed_bump)
+        # only the controllable network/decision slice carries jitter; the
+        # speed bump itself is a fixed hold imposed by the exchange
+        await asyncio.sleep(pre_bump * random.uniform(0.5, 1.5))
+
+        # fair (book mid) entering the uncancellable hold
+        mid0 = self._mid(token)
+        self._committed.add(oid)
+        try:
+            await asyncio.sleep(self.speed_bump)
+        finally:
+            self._committed.discard(oid)
+
         if market.close_ts <= time.time():
             self.fak_stats.record_kill()
-            return  # window closed while the order was in flight
+            return  # window closed during the hold
+
+        # re-validate against the post-bump book
         book = self.feed.books.get(token)
         ask = book.best_ask() if book else None
-        if not ask or ask[0] > price + self.EPS or ask[1] <= 0:
+        mid1 = self._mid(token)
+        drift = (mid1 - mid0) if (mid0 is not None and mid1 is not None) else 0.0
+
+        if not ask or ask[1] <= 0 or ask[0] > price + self.EPS:
+            # the side richened (BTC moved our way) or the quote vanished: a
+            # marketable FAK limit at our price can't reach it -> rejected.
+            # This is the favourable-miss arm of adverse selection: we only
+            # keep the prints that turned out bad.
             self.fak_stats.record_kill()
-            log.info("paper FAK killed: %s %s, ask gone from %.3f (lost the race)",
-                     market.title, outcome.upper(), price)
+            log.info("paper FAK rejected: %s %s, ask %s vs limit %.3f after "
+                     "%.0fms hold (fair drift %+.3f — quote richened/gone)",
+                     market.title, outcome.upper(),
+                     f"{ask[0]:.3f}" if ask else "gone", price,
+                     self.speed_bump * 1000, drift)
             return
+
+        # committed fill. We cannot escape the hold, so we take the print even
+        # though the side may have cheapened against us while we were frozen.
         self.fak_stats.record_fill()
+        if drift < -self.EPS:
+            self.fak_stats.record_adverse(-drift)
+            log.info("paper ADVERSE FILL: %s %s @ %.3f — fair drifted %+.3f "
+                     "against us during the %.0fms uncancellable hold",
+                     market.title, outcome.upper(), ask[0], drift,
+                     self.speed_bump * 1000)
         self.portfolio.on_fill(market, outcome, ask[0], min(shares, ask[1]),
                                taker=True, leg=leg)
 
@@ -368,12 +456,13 @@ class PaperExecutor:
             return None
         token = market.token_up if outcome == "up" else market.token_down
         if leg != "mm":
-            # taker legs are fill-and-kill, raced against everyone else who
-            # sees the same stale quote: the fill resolves after the simulated
-            # latency against whatever the book looks like then
+            # taker legs hit the itode speed bump: once submitted the order is
+            # committed for a fixed uncancellable hold and re-validated only at
+            # the end (see _speed_bump_fill). No first-come race, no cancel.
+            oid = f"paper-snipe-{next(self._ids)}"
             asyncio.ensure_future(
-                self._delayed_fak(market, outcome, token, price, shares, leg))
-            return None
+                self._speed_bump_fill(oid, market, outcome, token, price, shares, leg))
+            return oid
         book = self.feed.books.get(token)
         ask = book.best_ask() if book else None
         if ask and ask[0] <= price:
@@ -389,8 +478,15 @@ class PaperExecutor:
         return oid
 
     async def cancel(self, order_id: str) -> None:
-        # a live cancel takes a round trip too: the quote stays hittable while
-        # the cancel is in flight (this is when jump-guard pulls get picked off)
+        if order_id in self._committed:
+            # frozen inside the itode speed bump: no cancel escape. The
+            # jump-guard pull the strategy *thinks* it got does not exist live.
+            log.info("paper cancel ignored: %s is in the 250ms uncancellable hold",
+                     order_id)
+            return
+        # a resting GTC quote's cancel takes a round trip too: it stays hittable
+        # while the cancel is in flight (this is when jump-guard pulls get
+        # picked off)
         if self.cancel_latency > 0 and order_id in self.open_orders:
             asyncio.get_running_loop().call_later(
                 self.cancel_latency, lambda: self.open_orders.pop(order_id, None))
@@ -398,8 +494,10 @@ class PaperExecutor:
             self.open_orders.pop(order_id, None)
 
     async def cancel_market(self, market: Market) -> None:
+        # committed taker orders cannot be pulled; only resting GTC quotes go
         for oid in list(self.open_orders):
-            if self.open_orders[oid].market.slug == market.slug:
+            if (oid not in self._committed
+                    and self.open_orders[oid].market.slug == market.slug):
                 del self.open_orders[oid]
 
 
