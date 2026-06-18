@@ -332,7 +332,7 @@ class PaperExecutor:
     EPS = 1e-9
 
     def __init__(self, portfolio: Portfolio, feed: OrderBookFeed,
-                 taker_latency_ms: float = 400.0, speed_bump_ms: float = 250.0,
+                 taker_latency_ms: float = 410.0, speed_bump_ms: float = 250.0,
                  cancel_latency_ms: float = 150.0,
                  fak_min_fill_rate: float = 0.50, fak_min_attempts: int = 10,
                  fak_window_size: int = 30):

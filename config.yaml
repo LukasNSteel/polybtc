@@ -262,7 +262,7 @@ paper:
   # gone and the FAK is rejected; if it cheapened (BTC moved against us) we are
   # committed and filled anyway — adverse selection. Set taker_latency_ms 0 to
   # restore instant (optimistic) fills.
-  taker_latency_ms: 400      # max identified tick-to-trade budget (was 350)
+  taker_latency_ms: 410      # top of the identified tick-to-trade range (was 350)
   speed_bump_ms: 250         # mandatory uncancellable itode hold (subset of the budget)
   cancel_latency_ms: 150     # applies to resting MM (GTC) quotes only
 
