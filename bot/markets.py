@@ -27,6 +27,7 @@ class Market:
     tick: float
     kind: str             # "5m" | "15m" | "1h" | "4h"
     interval: str         # binance kline interval for open-price lookup
+    neg_risk: bool = False       # neg-risk markets route through a different exchange
     fee_rate: float = 0.07       # taker fee: rate * (p*(1-p))**exponent per share
     fee_exponent: float = 1.0
     accepting: bool = True
@@ -64,6 +65,7 @@ def _parse_market(e: dict, kind: str, interval: str, open_ts: int, close_ts: int
         tick=float(m.get("orderPriceMinTickSize", 0.01)),
         kind=kind,
         interval=interval,
+        neg_risk=bool(m.get("negRisk", False)),
         fee_rate=float(fs.get("rate", 0.07)) if m.get("feesEnabled") else 0.0,
         fee_exponent=float(fs.get("exponent", 1.0)),
         accepting=True,

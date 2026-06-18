@@ -234,6 +234,34 @@ sizing:
   max_position_usd_cap: 500    # absolute ceiling on per-market snipe cost
   scale_exposure: true         # scale max_total_exposure_usd with equity scale
 
+presign:
+  # EIP-712 pre-signing for the snipe/scalp taker path.
+  #
+  # The background presigner ALWAYS pre-warms the CLOB market-info cache
+  # (tick size / neg-risk / condition map) for active tokens, regardless of
+  # `enabled` — without it the FIRST taker order per market pays a hidden
+  # network round trip inside create_market_order. That prewarm is free
+  # (changes nothing about sizing) and removes a cold-start latency spike.
+  #
+  # With `enabled: true` it also keeps a small LADDER of pre-signed FAK BUY
+  # orders around each token's live best ask, so firing a snipe is just an
+  # HTTP POST (the ~few ms of signing already happened off the hot path).
+  # A FAK's collateral stake = price x shares varies per fire, so the ladder
+  # is built over (price level, $ stake bucket). On the fast path the bot
+  # uses a pre-signed order whose bucket is <= the desired stake and within
+  # `amount_tol` of it (so it NEVER oversizes); anything else falls back to
+  # live signing with identical behavior.
+  #
+  # OFF by default: turning it on means a fast-path snipe snaps its stake
+  # DOWN to the nearest pre-signed bucket. Tune the buckets to your real
+  # snipe/scalp stake range (sniper.max_take_usd, scalper.max_usd).
+  enabled: false
+  refresh_sec: 2.0           # rebuild/refresh the ladder this often
+  price_radius_ticks: 1      # pre-sign +/- this many ticks around the live best ask
+  amount_buckets_usd: [25, 50, 75, 100]  # collateral stake buckets to pre-sign
+  amount_tol: 0.7            # fast path only if a bucket is >= this fraction of desired stake
+  max_age_sec: 45            # drop pre-signed orders older than this (kept fresh vs the book)
+
 fak_monitor:
   # Graduated race-loss response: adjust live first, pause only when severe.
   enabled: true
@@ -275,7 +303,10 @@ live:
   # 0 = EOA holds positions directly (required for automatic on-chain merge/redeem)
   # 1 = email/magic proxy, 2 = browser wallet proxy (merge/redeem via Polymarket UI)
   signature_type: 0
-  polygon_rpc: https://polygon-rpc.com
+  # public Polygon RPC for on-chain merge/redeem. polygon-rpc.com now returns
+  # 401, so default to publicnode; swap in a private RPC (Alchemy/Infura) for
+  # production reliability from your Dublin box.
+  polygon_rpc: https://polygon-bor-rpc.publicnode.com
 
 log_dir: logs
 state_file: state.json   # positions/cash survive restarts (run with --fresh to ignore)

@@ -2,6 +2,16 @@ aiohttp>=3.9
 websockets>=12.0
 PyYAML>=6.0
 truststore>=0.9
-py-clob-client>=0.34.0
+py-clob-client-v2>=1.0
+# native libsecp256k1 signing backend: eth-keys auto-selects it when present,
+# cutting EIP-712 order signing from ~3.5ms (pure-Python) to ~0.15ms. Keeps
+# signing off the snipe critical path without pre-signing/size-bucketing.
+# Ships as a precompiled wheel for Linux x86-64 (the Dublin deploy target),
+# so `pip install` pulls the native build with no compiler/headers needed.
+# On exotic platforms pip may build from source (needs a C toolchain) or fall
+# back to pure Python — the bot logs the active backend at startup so a slow
+# fallback is caught, not silent.
+coincurve>=20.0
 web3>=7.0
 pandas>=2.0
+python-dotenv>=1.0

@@ -11,8 +11,10 @@ import os
 import time
 
 import truststore
+from dotenv import load_dotenv
 
 truststore.inject_into_ssl()  # use the OS trust store (matches curl/browser behavior)
+load_dotenv()  # pull POLYMARKET_* live-trading creds from .env (no-op if absent)
 
 from .binance_feed import BinanceFeed
 from .coinbase_feed import CoinbaseFeed
@@ -102,9 +104,19 @@ async def amain(args: argparse.Namespace) -> None:
             fak_min_fill_rate=cfg.get("fak_monitor", "min_fill_rate", default=0.50),
             fak_min_attempts=cfg.get("fak_monitor", "min_attempts", default=10),
             fak_window_size=cfg.get("fak_monitor", "window_size", default=30),
+            presign=cfg.get("presign", "enabled", default=False),
+            presign_refresh_sec=cfg.get("presign", "refresh_sec", default=2.0),
+            presign_price_radius_ticks=cfg.get("presign", "price_radius_ticks", default=1),
+            presign_amount_buckets_usd=tuple(
+                cfg.get("presign", "amount_buckets_usd", default=[25, 50, 75, 100])),
+            presign_amount_tol=cfg.get("presign", "amount_tol", default=0.7),
+            presign_max_age_sec=cfg.get("presign", "max_age_sec", default=45.0),
         )
         tasks.append(executor.run_user_feed())
         tasks.append(executor.process_onchain())
+        # pre-warm market-info caches (and, if enabled, keep the pre-signed
+        # FAK ladder warm) for every market we currently trade
+        tasks.append(executor.run_presigner(feed, lambda: list(markets.active.values())))
         log.warning("LIVE MODE: real orders will be placed.")
     else:
         executor = PaperExecutor(

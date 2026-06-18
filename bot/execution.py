@@ -104,6 +104,56 @@ class FakStats:
 USER_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/user"
 
 
+def _signing_backend() -> tuple[bool, str]:
+    """Return (is_native, name) for eth-keys' active secp256k1 backend.
+    The native libsecp256k1 backend (coincurve) signs an order in ~0.15ms vs
+    ~3.5ms for the pure-Python fallback — a 22x cut that keeps EIP-712 signing
+    off the snipe critical path. We surface this at startup so a fallback to
+    pure Python (e.g. coincurve missing on the deploy box) is loud, not silent."""
+    try:
+        from eth_keys.backends import get_default_backend_class
+        name = str(get_default_backend_class())
+    except Exception as e:  # noqa: BLE001 — never let a probe stop the bot
+        return False, f"unknown ({e})"
+    return "coincurve" in name.lower(), name.rsplit(".", 1)[-1]
+
+
+def _parse_fill_shares(resp: dict, requested: float) -> float:
+    """Shares filled by a marketable FAK buy, parsed from the post-order
+    response. Falls back to `requested` on a MATCHED/FILLED status with no
+    explicit amount, and 0 on any error/no-fill."""
+    if not isinstance(resp, dict):
+        return 0.0
+    for key in ("takingAmount", "taking_amount", "size_matched", "sizeMatched"):
+        val = resp.get(key)
+        if val is not None:
+            try:
+                return float(val)
+            except (TypeError, ValueError):
+                pass
+    if resp.get("success") is False or resp.get("error"):
+        return 0.0
+    status = str(resp.get("status") or "").upper()
+    if status in ("MATCHED", "FILLED"):
+        return requested
+    return 0.0
+
+
+def _parse_fill_price(resp: dict, fallback: float) -> float:
+    """Average fill price (collateral spent / shares received) when the
+    response reports both legs, else the limit price (a conservative upper
+    bound — a FAK buy never fills above its limit)."""
+    if isinstance(resp, dict):
+        making = resp.get("makingAmount") or resp.get("making_amount")
+        taking = resp.get("takingAmount") or resp.get("taking_amount")
+        try:
+            if making and taking and float(taking) > 0:
+                return round(float(making) / float(taking), 4)
+        except (TypeError, ValueError):
+            pass
+    return fallback
+
+
 @dataclass
 class Position:
     up: float = 0.0
@@ -493,6 +543,14 @@ class PaperExecutor:
         else:
             self.open_orders.pop(order_id, None)
 
+    async def cancel_orders(self, order_ids) -> None:
+        for oid in list(order_ids):
+            await self.cancel(oid)
+
+    async def cancel_all(self) -> None:
+        for oid in list(self.open_orders):
+            await self.cancel(oid)
+
     async def cancel_market(self, market: Market) -> None:
         # committed taker orders cannot be pulled; only resting GTC quotes go
         for oid in list(self.open_orders):
@@ -502,25 +560,56 @@ class PaperExecutor:
 
 
 class LiveExecutor:
-    """Real orders through the Polymarket CLOB via py-clob-client."""
+    """Real orders through the Polymarket CLOB via py-clob-client-v2 (CLOB V2).
+
+    Built for a signature_type 0 (plain EOA) wallet: the EOA signs orders and
+    holds positions/collateral directly, so — unlike a deposit wallet — no
+    per-order balance-allowance sync sits on the critical path. Combined with
+    the speed bump being gone on crypto markets, the live order path is just
+    sign-locally + one HTTP POST, i.e. as fast as the venue allows.
+    """
 
     def __init__(self, portfolio: Portfolio, host: str, chain_id: int,
-                 private_key: str, funder: str, signature_type: int,
+                 private_key: str, funder: str | None, signature_type: int,
                  onchain=None, fak_min_fill_rate: float = 0.50,
-                 fak_min_attempts: int = 10, fak_window_size: int = 30):
-        from py_clob_client.client import ClobClient
+                 fak_min_attempts: int = 10, fak_window_size: int = 30,
+                 presign: bool = False, presign_refresh_sec: float = 2.0,
+                 presign_price_radius_ticks: int = 1,
+                 presign_amount_buckets_usd: tuple | None = None,
+                 presign_amount_tol: float = 0.7,
+                 presign_max_age_sec: float = 45.0):
+        from py_clob_client_v2 import ClobClient
 
         self.portfolio = portfolio
-        self.client = ClobClient(
-            host, key=private_key, chain_id=chain_id,
-            signature_type=signature_type, funder=funder,
-        )
-        self.client.set_api_creds(self.client.create_or_derive_api_creds())
+        kwargs = {"key": private_key, "chain_id": chain_id,
+                  "signature_type": signature_type}
+        if funder:  # EOA (type 0) holds funds itself; only proxies need a funder
+            kwargs["funder"] = funder
+        self.client = ClobClient(host, **kwargs)
+        self.client.set_api_creds(self.client.create_or_derive_api_key())
+        self.signature_type = signature_type
+        self.address = funder or self.client.get_address()
         self.open_orders: dict[str, OpenOrder] = {}
         self.fak_stats = FakStats(fak_min_fill_rate, fak_min_attempts, fak_window_size)
-        self._fak_filled: dict[str, bool] = {}  # order_id -> got any taker fill
         self._seen_trades: set[str] = set()
         self.onchain = onchain
+        # ---- EIP-712 pre-signing (snipe/scalp fast path) ----
+        # The background presigner (run_presigner) always pre-warms the CLOB
+        # market-info cache for active tokens so the first taker order per
+        # market never pays a network round trip inside create_market_order.
+        # When `presign` is on it additionally keeps a ladder of pre-signed
+        # FAK orders around the live best ask, keyed by (price, $ stake); the
+        # taker path posts a matching one directly (signing already done).
+        self._presign_enabled = bool(presign)
+        self._presign_refresh = max(0.25, float(presign_refresh_sec))
+        self._presign_radius = max(0, int(presign_price_radius_ticks))
+        self._presign_buckets = tuple(sorted(
+            round(float(b), 2) for b in (presign_amount_buckets_usd or ())))
+        self._presign_amount_tol = float(presign_amount_tol)
+        self._presign_max_age = float(presign_max_age_sec)
+        # token -> {(price, amount): (signed_order, signed_at)}
+        self._presigned: dict[str, dict[tuple[float, float], tuple]] = {}
+        self._warmed_tokens: set[str] = set()
         self._merge_queue: dict[str, Market] = {}   # condition_id -> market
         self._redeem_queue: dict[str, Market] = {}
         self._tracked_conditions: set[str] = set()
@@ -529,7 +618,16 @@ class LiveExecutor:
             portfolio.merge_hook = lambda market, pairs: self._merge_queue.setdefault(
                 market.condition_id, market)
         portfolio.summary_hooks.append(self.fak_stats.summary_lines)
-        log.info("live executor ready (funder %s...)", funder[:10])
+        native_sign, backend_name = _signing_backend()
+        if native_sign:
+            log.info("EIP-712 signing backend: %s (native, ~0.15ms/order)", backend_name)
+        else:
+            log.warning("EIP-712 signing backend: %s — PURE PYTHON, ~3.5ms/order. "
+                        "Install `coincurve` for the ~22x faster native backend "
+                        "(critical for the snipe race).", backend_name)
+        log.info("live executor ready (CLOB v2, signature_type %d, address %s..., "
+                 "pre-sign %s)", signature_type, self.address[:10],
+                 "on" if self._presign_enabled else "off (prewarm only)")
 
     def track_markets(self, condition_ids: set[str]) -> None:
         """Keep the user websocket subscribed to all markets we trade."""
@@ -563,56 +661,255 @@ class LiveExecutor:
 
     async def place_buy(self, market: Market, outcome: str, price: float, shares: float,
                         leg: str = "mm") -> str | None:
-        from py_clob_client.clob_types import OrderArgs, OrderType
-        from py_clob_client.order_builder.constants import BUY
+        from py_clob_client_v2 import (
+            MarketOrderArgs, OrderArgs, OrderType, PartialCreateOrderOptions, Side,
+        )
 
         if shares < MIN_SHARES:
             return None
         token = market.token_up if outcome == "up" else market.token_down
-        args = OrderArgs(price=round(price, 3), size=round(shares, 2), side=BUY, token_id=token)
-        # taker legs are fill-and-kill: take what's available at our price,
-        # never leave a remainder resting on the book as a stale quote for
-        # someone else to pick off. Only MM quotes rest (GTC).
-        order_type = OrderType.GTC if leg == "mm" else OrderType.FAK
-        try:
-            signed = await asyncio.to_thread(self.client.create_order, args)
-            resp = await asyncio.to_thread(self.client.post_order, signed, order_type)
-        except Exception as e:
-            log.warning("order rejected: %s", e)
-            return None
-        oid = resp.get("orderID")
-        if oid:
-            self.open_orders[oid] = OpenOrder(oid, market, outcome, token, price, shares, leg=leg)
-            if order_type != OrderType.GTC:
-                self.fak_stats.record_attempt()
-                self._fak_filled[oid] = False
-                # FAK orders never rest; keep the entry just long enough for
-                # the user-feed trade event to attribute the fill, then drop it
-                asyncio.get_running_loop().call_later(
-                    30.0, lambda o=oid: self._resolve_fak(o))
-        return oid
+        opts = PartialCreateOrderOptions(neg_risk=market.neg_risk)
+        price = round(price, 3)
+        shares = round(shares, 2)
 
-    def _resolve_fak(self, order_id: str) -> None:
-        """Count zero-fill FAK orders as race losses once the fill window closes."""
-        o = self.open_orders.pop(order_id, None)
-        filled = self._fak_filled.pop(order_id, False)
-        if o is None or filled:
-            return
-        self.fak_stats.record_kill()
-        log.info("live FAK killed: %s %s @ %.3f (lost the race)",
-                 o.market.title, o.outcome.upper(), o.price)
+        if leg == "mm":
+            # resting maker quote (GTC). Fills arrive asynchronously on the
+            # authenticated user feed (handled in _handle_user_msg).
+            try:
+                signed = await asyncio.to_thread(
+                    self.client.create_order,
+                    OrderArgs(price=price, size=shares, side=Side.BUY,
+                              token_id=token, expiration=0),
+                    opts)
+                resp = await asyncio.to_thread(self.client.post_order, signed, OrderType.GTC)
+            except Exception as e:
+                log.warning("MM order rejected: %s", e)
+                return None
+            oid = (resp.get("orderID") or resp.get("orderId")) if isinstance(resp, dict) else None
+            if oid:
+                self.open_orders[oid] = OpenOrder(oid, market, outcome, token, price, shares, leg=leg)
+            else:
+                log.warning("MM order returned no id: %s", resp)
+            return oid
+
+        # taker leg (snipe/scalp): marketable fill-and-kill. A market BUY is
+        # quoted in COLLATERAL (pUSD), rounded to 2dp, capped at our limit
+        # price — never leaves a remainder resting. The fill is settled
+        # synchronously from the response (not via the user feed), so the
+        # position is recorded the moment the FAK returns.
+        amount = round(shares * price, 2)
+        if amount <= 0:
+            return None
+        self.fak_stats.record_attempt()
+        # fast path: a pre-signed order whose stake bucket is <= the desired
+        # stake (never oversizes) and within tolerance keeps EIP-712 signing
+        # off the critical path — fire is then just the HTTP POST below.
+        used_amount = amount
+        presigned = self._take_presigned(token, price, amount) if self._presign_enabled else None
+        try:
+            if presigned is not None:
+                signed, used_amount = presigned
+            else:
+                signed = await asyncio.to_thread(
+                    self.client.create_market_order,
+                    MarketOrderArgs(token_id=token, amount=used_amount, side=Side.BUY,
+                                    price=price, order_type=OrderType.FAK),
+                    opts)
+            resp = await asyncio.to_thread(self.client.post_order, signed, OrderType.FAK)
+        except Exception as e:
+            log.warning("taker order rejected: %s", e)
+            self.fak_stats.record_kill()
+            return None
+        requested = used_amount / price if price > 0 else shares
+        filled = _parse_fill_shares(resp, requested)
+        if filled > 0:
+            self.fak_stats.record_fill()
+            avg = _parse_fill_price(resp, price)
+            self._log_fee_ground_truth(market, outcome, avg, filled, resp)
+            self.portfolio.on_fill(market, outcome, avg, filled, taker=True, leg=leg)
+        else:
+            self.fak_stats.record_kill()
+            log.info("live FAK killed: %s %s @ %.3f (no fill)",
+                     market.title, outcome.upper(), price)
+        return (resp.get("orderID") or resp.get("orderId")) if isinstance(resp, dict) else None
+
+    def _log_fee_ground_truth(self, market: Market, outcome: str, avg: float,
+                              shares: float, resp) -> None:
+        """Record the REAL taker fee from a live fill next to what our model
+        assumed, so we can confirm/calibrate the paper bot's fee formula
+        (rate * p*(1-p) * shares). Polymarket's published schedule (Gamma) and
+        the CLOB's base-fee field don't obviously agree, and the p*(1-p) vs
+        min(p,1-p) form is unverified — a real fill is the only ground truth.
+
+        Dumps whatever fee/amount fields the response actually carries; on a
+        BUY the fee is taken in shares, so collateral_paid/shares - avg ~ the
+        per-share fee when the response reports both legs."""
+        modeled = market.taker_fee_per_share(avg) * shares
+        raw = {k: resp.get(k) for k in (
+            "fee", "feeRateBps", "fee_rate_bps", "makerFeeRateBps",
+            "makingAmount", "making_amount", "takingAmount", "taking_amount",
+            "price", "status") if isinstance(resp, dict) and k in resp} or "(none in response)"
+        implied = None
+        if isinstance(resp, dict):
+            making = resp.get("makingAmount") or resp.get("making_amount")
+            taking = resp.get("takingAmount") or resp.get("taking_amount")
+            try:
+                if making and taking and float(taking) > 0:
+                    implied = float(making) / float(taking) - avg  # per-share fee, if any
+            except (TypeError, ValueError):
+                implied = None
+        log.info("FEE CHECK %s %s: modeled $%.4f (rate %.3f exp %.1f, %.2f sh @ %.3f, "
+                 "%.4f/sh)%s | live fill fields: %s", market.title, outcome.upper(),
+                 modeled, market.fee_rate, market.fee_exponent, shares, avg,
+                 modeled / shares if shares else 0.0,
+                 f" | implied {implied:+.4f}/sh" if implied is not None else "", raw)
+
+    # ---------- EIP-712 pre-signing ----------
+
+    def _build_taker_order(self, token: str, amount: float, price: float, neg_risk: bool):
+        """Build + EIP-712 sign one marketable FAK BUY (collateral = `amount`).
+        Pure-CPU once the token's market info is cached (see run_presigner)."""
+        from py_clob_client_v2 import (
+            MarketOrderArgs, OrderType, PartialCreateOrderOptions, Side,
+        )
+        return self.client.create_market_order(
+            MarketOrderArgs(token_id=token, amount=round(amount, 2), side=Side.BUY,
+                            price=round(price, 3), order_type=OrderType.FAK),
+            PartialCreateOrderOptions(neg_risk=neg_risk))
+
+    def _take_presigned(self, token: str, price: float, amount: float):
+        """Pop the best pre-signed order for (token, price): the largest stake
+        bucket that does not exceed `amount` and is within `amount_tol` of it.
+        Returns (signed_order, bucket_amount) or None (-> live sign)."""
+        slots = self._presigned.get(token)
+        if not slots:
+            return None
+        now = time.time()
+        floor = amount * self._presign_amount_tol
+        best_key = None
+        best_amt = -1.0
+        for key, (_signed, ts) in list(slots.items()):
+            p, amt = key
+            if now - ts > self._presign_max_age:
+                del slots[key]
+                continue
+            if abs(p - price) > 1e-9 or amt > amount + 1e-9 or amt < floor:
+                continue
+            if amt > best_amt:
+                best_amt, best_key = amt, key
+        if best_key is None:
+            return None
+        signed, _ts = slots.pop(best_key)
+        return signed, best_key[1]
+
+    async def _refresh_token_ladder(self, market: Market, token: str, best_ask: float) -> None:
+        tick = market.tick or 0.01
+        center = round(best_ask / tick) * tick
+        prices = []
+        for k in range(-self._presign_radius, self._presign_radius + 1):
+            p = round(center + k * tick, 3)
+            if tick <= p <= 1 - tick:
+                prices.append(p)
+        slots = self._presigned.setdefault(token, {})
+        now = time.time()
+        for p in prices:
+            for amt in self._presign_buckets:
+                cur = slots.get((p, amt))
+                if cur and now - cur[1] <= self._presign_max_age:
+                    continue  # still fresh
+                try:
+                    signed = await asyncio.to_thread(
+                        self._build_taker_order, token, amt, p, market.neg_risk)
+                    slots[(p, amt)] = (signed, time.time())
+                except Exception as e:  # noqa: BLE001 — one bad level shouldn't stall the ladder
+                    log.debug("presign build %s @ %.3f $%.0f failed: %s",
+                              market.title, p, amt, e)
+        keep = set(prices)
+        for key in list(slots):  # drop levels that drifted out of the window
+            if key[0] not in keep:
+                del slots[key]
+
+    async def run_presigner(self, feed, markets_provider) -> None:
+        """Background loop. Always pre-warms the CLOB market-info cache for
+        active tokens (so the first taker order per market is sign-only, no
+        network). When pre-signing is enabled it also keeps a small ladder of
+        pre-signed FAK orders around each token's live best ask."""
+        while True:
+            await asyncio.sleep(self._presign_refresh)
+            try:
+                markets = list(markets_provider())
+            except Exception as e:  # noqa: BLE001
+                log.debug("presigner: market provider failed: %s", e)
+                continue
+            live_tokens: set[str] = set()
+            for m in markets:
+                for token in (m.token_up, m.token_down):
+                    live_tokens.add(token)
+                    if token not in self._warmed_tokens:
+                        try:
+                            await asyncio.to_thread(
+                                self.client.get_clob_market_info, m.condition_id)
+                            self._warmed_tokens.add(token)
+                        except Exception as e:  # noqa: BLE001
+                            log.debug("presign prewarm %s failed: %s", m.title, e)
+                            continue
+                    if not self._presign_enabled or not self._presign_buckets:
+                        continue
+                    book = feed.books.get(token)
+                    ask = book.best_ask() if book else None
+                    if ask:
+                        await self._refresh_token_ladder(m, token, ask[0])
+            for token in list(self._presigned):  # forget markets we no longer trade
+                if token not in live_tokens:
+                    del self._presigned[token]
 
     async def cancel(self, order_id: str) -> None:
+        from py_clob_client_v2 import OrderPayload
         try:
-            await asyncio.to_thread(self.client.cancel, order_id)
+            await asyncio.to_thread(self.client.cancel_order, OrderPayload(orderID=order_id))
         except Exception as e:
             log.warning("cancel failed %s: %s", order_id, e)
         self.open_orders.pop(order_id, None)
 
+    async def cancel_orders(self, order_ids) -> None:
+        """Cancel many resting orders in a SINGLE round trip — for yanking a
+        whole book of quotes the instant BTC swings or a window closes."""
+        ids = [oid for oid in dict.fromkeys(order_ids) if oid]
+        if not ids:
+            return
+        try:
+            await asyncio.to_thread(self.client.cancel_orders, ids)
+        except Exception as e:
+            log.warning("batch cancel of %d orders failed: %s", len(ids), e)
+        for oid in ids:
+            self.open_orders.pop(oid, None)
+
+    async def cancel_all(self) -> None:
+        """Cancel every resting order for this account in one call (kill switch
+        / feed stall). Pre-signed FAK orders are unaffected (unique salt, no
+        nonce bump), but they aren't resting so nothing here touches them."""
+        try:
+            await asyncio.to_thread(self.client.cancel_all)
+        except Exception as e:
+            log.warning("cancel-all failed: %s", e)
+        self.open_orders.clear()
+
     async def cancel_market(self, market: Market) -> None:
-        for oid in list(self.open_orders):
-            if self.open_orders[oid].market.slug == market.slug:
-                await self.cancel(oid)
+        """Cancel all of our resting orders in one market, server-side in a
+        single call; fall back to a batch by id if the market cancel errors."""
+        from py_clob_client_v2 import OrderMarketCancelParams
+        try:
+            await asyncio.to_thread(self.client.cancel_market_orders,
+                                    OrderMarketCancelParams(market=market.condition_id))
+        except Exception as e:
+            log.warning("market cancel failed for %s: %s; falling back to batch",
+                        market.title, e)
+            await self.cancel_orders(
+                oid for oid, o in self.open_orders.items() if o.market.slug == market.slug)
+            return
+        for oid, o in list(self.open_orders.items()):
+            if o.market.slug == market.slug:
+                self.open_orders.pop(oid, None)
 
     # ---------- fill tracking via the CLOB user websocket ----------
 
@@ -633,28 +930,9 @@ class LiveExecutor:
             if not tid or tid in self._seen_trades:
                 return  # trades emit repeated status updates (MATCHED/MINED/...)
             self._seen_trades.add(tid)
-            # we may be the taker...
-            taker_oid = d.get("taker_order_id")
-            if taker_oid in self.open_orders:
-                if not self._fak_filled.get(taker_oid):
-                    self._fak_filled[taker_oid] = True
-                    self.fak_stats.record_fill()
-                price = float(d.get("price", 0))
-                size = float(d.get("size", 0))
-                # FEE VERIFICATION: docs say fee = 0.07*p*(1-p)/share (what the
-                # bot models); a third-party bot's live fills matched the old
-                # 0.07*min(p,1-p) formula instead. Log what the exchange
-                # actually reports so the first live fill settles the question
-                # (research/REPORT.md addendum). Remove once confirmed.
-                fee_fields = {k: v for k, v in d.items() if "fee" in k.lower()}
-                if price > 0 and size > 0:
-                    log.info("FEE CHECK trade %s: price=%.3f size=%.2f | exchange fee "
-                             "fields=%s | formula p(1-p)=%.4f/sh min(p,1-p)=%.4f/sh",
-                             tid, price, size, fee_fields or "(none reported)",
-                             0.07 * price * (1 - price),
-                             0.07 * min(price, 1 - price))
-                self._apply_fill(taker_oid, price, size, taker=True)
-            # ...and/or one of the makers (most fills for this strategy)
+            # Resting maker (GTC) fills — the bulk of this strategy. Taker
+            # (FAK) fills are settled synchronously in place_buy, so they are
+            # never tracked here (not added to open_orders) and can't double-count.
             for mo in d.get("maker_orders", []):
                 oid = mo.get("order_id")
                 if oid in self.open_orders:

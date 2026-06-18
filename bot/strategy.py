@@ -51,6 +51,7 @@ class Strategy:
         }
         self._scaling_reverted = False
         self._size_caps_cache: dict | None = None
+        self._guard_was_allowed = True  # detect jump-guard trips for an instant batch yank
         log_dir = cfg.get("log_dir", default="logs")
         os.makedirs(log_dir, exist_ok=True)
         self._calib_path = os.path.join(log_dir, "calibration.csv")
@@ -618,9 +619,9 @@ class Strategy:
                 log.exception("strategy step failed")
 
     async def _pull_all_quotes(self) -> None:
-        for slug, state in self.quotes.items():
-            for side in list(state):
-                await self.exec.cancel(state.pop(side)[0])
+        ids = [state.pop(side)[0] for state in self.quotes.values() for side in list(state)]
+        if ids:
+            await self.exec.cancel_orders(ids)  # single round trip yanks the whole book
 
     async def _step(self) -> None:
         if self.killed:
@@ -641,6 +642,13 @@ class Strategy:
         # quotes — _market_make pulls them while the guard is tripped
         # (the sniper keeps running: a jump is exactly its moment)
         self.jump_guard.update(spot, self.binance.vol_per_sec, now)
+        # the instant the guard trips (BTC swing), yank every resting quote in
+        # one batch call rather than waiting for each market's _market_make to
+        # pull them side-by-side over the next ticks
+        guard_ok = self.jump_guard.allowed(now)
+        if self._guard_was_allowed and not guard_ok and self.quotes:
+            await self._pull_all_quotes()
+        self._guard_was_allowed = guard_ok
         self.markouts.resolve(self._token_mid, now)
 
         # keep clob subscriptions in sync with active markets
@@ -724,8 +732,7 @@ class Strategy:
             log.error("KILL SWITCH: equity $%.2f, down $%.2f this session (limit $%.0f). "
                       "Cancelling all orders.",
                       equity, self._session_start_equity - equity, kill)
-            for m in list(self.markets.active.values()):
-                await self.exec.cancel_market(m)
+            await self.exec.cancel_all()  # yank everything in a single call
             self.quotes.clear()
             self.portfolio.log_summary()
             if not self.paper:

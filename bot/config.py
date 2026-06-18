@@ -28,10 +28,11 @@ class Config:
 
 def live_credentials() -> dict[str, str]:
     key = os.environ.get("POLYMARKET_PRIVATE_KEY", "")
-    funder = os.environ.get("POLYMARKET_FUNDER", "")
-    if not key or not funder:
+    if not key:
         raise SystemExit(
-            "Live mode requires POLYMARKET_PRIVATE_KEY and POLYMARKET_FUNDER "
-            "environment variables. See README.md."
+            "Live mode requires POLYMARKET_PRIVATE_KEY (the EOA private key). "
+            "POLYMARKET_FUNDER is only needed for proxy/deposit wallets "
+            "(signature_type 1/2/3); a plain EOA (type 0) holds funds itself. "
+            "See README.md."
         )
-    return {"private_key": key, "funder": funder}
+    return {"private_key": key, "funder": os.environ.get("POLYMARKET_FUNDER", "")}

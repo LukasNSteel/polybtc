@@ -125,8 +125,10 @@ pip install -r requirements.txt
 python -m bot.main
 
 # live trading: real orders on the CLOB
-export POLYMARKET_PRIVATE_KEY=0x...   # wallet private key
-export POLYMARKET_FUNDER=0x...        # your Polymarket proxy wallet (profile address)
+# put your creds in a .env file (gitignored, loaded automatically):
+#   POLYMARKET_PRIVATE_KEY=0x...   # wallet private key
+#   POLYMARKET_FUNDER=0x...        # your Polymarket proxy wallet (profile address)
+# (or export them as environment variables instead)
 python -m bot.main --live
 
 # dashboard: dark-mode web UI over session logs / state.json, auto-refreshes
