@@ -1,4 +1,13 @@
-# polybtc bot configuration
+# polybtc bot configuration — $250 LIVE tier
+#
+# Same strategy as config.yaml, with risk/sizing caps scaled down to a ~$250
+# bankroll. Run with:  python -m bot.main --config config.live250.yaml --live
+#
+# Capital baseline is NOT hardcoded: in --live mode the bot reads the wallet's
+# real pUSD collateral at startup and uses it as the equity baseline for the
+# kill switch and equity-scaling (see live.seed_from_wallet below). The dollar
+# caps here are sized for the ~$250 tier; sizing.reference_equity is left unset
+# so it follows the wallet-read baseline.
 
 asset: BTC
 binance_symbol: BTCUSDT
@@ -162,10 +171,10 @@ sniper:
   max_ask: 0.80                # above this the snipe edge was fee-dead live
                                # (-21.6%); near-certainty buys belong to the
                                # scalper and its 0.997 probability gate
-  max_take_usd: 100            # capacity is there: median ~$650 printed notional
-                               # per qualifying 5m market in the edge bucket
-  max_position_usd: 150        # per-market snipe cost cap (decoupled from the
-                               # now-disabled MM leg's cap)
+  max_take_usd: 25             # $250 tier: ~10% of bankroll per single take
+                               # (was 100 at the $1k tier)
+  max_position_usd: 40         # per-market snipe cost cap (~16% of bankroll;
+                               # was 150 at the $1k tier)
   max_inventory_frac: 0.25     # skip a side once net same-side inventory exceeds
                                # this fraction of max_position_usd: stacking one
                                # side on the same lagging signal built every
@@ -197,7 +206,7 @@ scalper:
                                # argument (it can also see the resolution source)
   max_price: 0.99              # was 0.999: above 0.99 the fee eats the entire
                                # edge (+0.3-0.6%/$1 at best, n.s.)
-  max_usd: 100                 # max USDC per scalp
+  max_usd: 25                  # $250 tier: max USDC per scalp (was 100)
   limit_slack_ticks: 2         # FAK limit tolerance (ticks); capped at max_price
                                # so a probe never pays past the tested band
 
@@ -235,11 +244,11 @@ guards:
   markout_horizons_sec: [10, 60]
 
 risk:
-  max_total_exposure_usd: 500  # base exposure cap; scales with equity up to ceiling
-  max_total_exposure_ceiling: 500  # hard book ceiling (never exceed even when scaled up)
-  kill_switch_loss_usd: 300    # floor: minimum absolute session drawdown stop
+  max_total_exposure_usd: 125  # $250 tier: ~50% of bankroll deployed at once
+  max_total_exposure_ceiling: 125  # hard book ceiling (never exceed even when scaled up)
+  kill_switch_loss_usd: 40     # floor: minimum absolute session drawdown stop (~16%)
   kill_switch_loss_frac: 0.30 # session drawdown stop = this fraction of session-start equity
-  kill_switch_loss_cap_usd: 500  # ceiling on the proportional kill limit
+  kill_switch_loss_cap_usd: 75   # ceiling on the proportional kill limit (~30% of $250)
   max_feed_age_sec: 5          # pull all quotes if the price feed stalls this long
   vol_warmup_sec: 90           # no sniper/scalper trades until the vol EWMA has
                                # this many seconds of samples. At cold start vol
@@ -254,12 +263,14 @@ sizing:
   # Exposure scales the same way, capped at risk.max_total_exposure_ceiling.
   enabled: true
   mode: sqrt                   # sqrt(equity/ref) or step at equity_tiers
-  reference_equity: 1000       # defaults to paper.starting_cash if omitted
+  reference_equity: null       # unset on purpose: follows the wallet-read equity
+                               # baseline (live.seed_from_wallet), so scaling
+                               # pivots around your real ~$250 funded balance
   min_scale: 0.5               # never shrink below 50% of base caps on drawdown
-  equity_tiers: [2500, 5000, 10000]   # step mode only
-  tier_multipliers: [1.0, 1.25, 1.5, 2.0]  # below $2.5k, then each tier
-  max_take_usd_cap: 500        # absolute ceiling on scaled snipe/scalp takes
-  max_position_usd_cap: 500    # absolute ceiling on per-market snipe cost
+  equity_tiers: [500, 1000, 2500]     # step mode only (scaled for the $250 tier)
+  tier_multipliers: [1.0, 1.25, 1.5, 2.0]  # below $500, then each tier
+  max_take_usd_cap: 125        # absolute ceiling on scaled snipe/scalp takes
+  max_position_usd_cap: 125    # absolute ceiling on per-market snipe cost
   scale_exposure: true         # scale max_total_exposure_usd with equity scale
 
 presign:
@@ -286,7 +297,7 @@ presign:
   enabled: false
   refresh_sec: 2.0           # rebuild/refresh the ladder this often
   price_radius_ticks: 1      # pre-sign +/- this many ticks around the live best ask
-  amount_buckets_usd: [25, 50, 75, 100]  # collateral stake buckets to pre-sign
+  amount_buckets_usd: [5, 10, 15, 25]  # collateral stake buckets to pre-sign ($250 tier)
   amount_tol: 0.7            # fast path only if a bucket is >= this fraction of desired stake
   max_age_sec: 45            # drop pre-signed orders older than this (kept fresh vs the book)
 
@@ -313,7 +324,9 @@ fak_monitor:
                                # can't otherwise refresh while takers are paused.
 
 paper:
-  starting_cash: 1000
+  # IGNORED in --live mode: the equity baseline is read from the wallet
+  # (live.seed_from_wallet). Only used for paper runs against this config.
+  starting_cash: 250
   # execution realism. Taker (snipe/scalp) orders model the itode speed-bump
   # mechanism: total tick-to-trade budget is taker_latency_ms (Binance-Tokyo
   # signal travel + Dublin decide/submit + the mandatory speed bump). The last
@@ -354,6 +367,10 @@ live:
   # wallet. Confirmed type 3 for this funder via `python -m bot.sigtype_probe`
   # (the only type the maker isn't rejected on). Requires POLYMARKET_FUNDER.
   signature_type: 3
+  # Seed the equity baseline (kill switch + sizing reference) from the wallet's
+  # real pUSD collateral at startup instead of paper.starting_cash. Set false to
+  # fall back to the configured starting_cash.
+  seed_from_wallet: true
   # public Polygon RPC for on-chain merge/redeem. polygon-rpc.com now returns
   # 401, so default to publicnode; swap in a private RPC (Alchemy/Infura) for
   # production reliability from your Dublin box.

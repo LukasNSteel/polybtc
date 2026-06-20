@@ -37,6 +37,11 @@ class FakStats:
         self.adverse_fills = 0
         self.adverse_drift = 0.0
         self._recent: deque[bool] = deque(maxlen=window_size)
+        # wall-clock of the last taker attempt; used to expire a stale rolling
+        # window so a pause can't deadlock (paused takers log no new outcomes,
+        # so the window would otherwise stay frozen below the resume threshold
+        # forever — see Strategy._check_fak_monitor).
+        self.last_attempt_ts = 0.0
 
     def record_fill(self) -> None:
         self.fills += 1
@@ -54,6 +59,20 @@ class FakStats:
 
     def record_attempt(self) -> None:
         self.attempts += 1
+        self.last_attempt_ts = time.time()
+
+    def decay_if_stale(self, stale_sec: float) -> bool:
+        """Clear the rolling window if no taker has been attempted for
+        `stale_sec`. Returns True if it cleared. This is the recovery valve for
+        the pause deadlock: while takers are paused no outcomes are recorded, so
+        the window goes stale and is forgotten, letting the monitor re-probe
+        from a clean slate instead of staying frozen on an old bad streak."""
+        if stale_sec <= 0 or not self._recent:
+            return False
+        if self.last_attempt_ts and (time.time() - self.last_attempt_ts) > stale_sec:
+            self._recent.clear()
+            return True
+        return False
 
     def session_fill_rate(self) -> float | None:
         if not self.attempts:
@@ -381,11 +400,19 @@ class PaperExecutor:
 
     EPS = 1e-9
 
+    # how far below fair (book mid) a quote must sit to count as "fully
+    # contested" — at this discount every latency arb races it, so our capture
+    # of the displayed size goes to ~0. 0.10 = 10c below mid.
+    CONTENTION_SCALE = 0.10
+
     def __init__(self, portfolio: Portfolio, feed: OrderBookFeed,
                  taker_latency_ms: float = 410.0, speed_bump_ms: float = 250.0,
                  cancel_latency_ms: float = 150.0,
                  fak_min_fill_rate: float = 0.50, fak_min_attempts: int = 10,
-                 fak_window_size: int = 30):
+                 fak_window_size: int = 30,
+                 fill_realism: bool = True, capture: float = 0.30,
+                 edge_contention: bool = True, race_loss_prob: float = 0.20,
+                 feed_lag_ms: float = 150.0):
         self.portfolio = portfolio
         self.feed = feed
         self.taker_latency = taker_latency_ms / 1000.0
@@ -393,6 +420,25 @@ class PaperExecutor:
         # the rest is signal travel + Dublin decide/submit (the controllable bit)
         self.speed_bump = min(speed_bump_ms / 1000.0, self.taker_latency)
         self.cancel_latency = cancel_latency_ms / 1000.0
+        # ---- snipe fill-realism haircut (paper only) ----
+        # The naive paper model wins the full displayed size of every stale cheap
+        # quote, uncontested — the dominant reason paper PnL overstates live. These
+        # knobs model the snipe RACE you actually face from Dublin:
+        #   capture        — avg fraction of the displayed top-of-book size we win
+        #   edge_contention — richer (more underpriced) quotes are more contested,
+        #                     so capture scales toward 0 as the discount to mid grows
+        #   race_loss_prob — chance a faster/colocated arb takes the whole quote
+        #                    before our order lands (a full miss)
+        #   feed_lag       — our WS book trails the matching engine; we re-validate
+        #                    against a book this much fresher, so favourable moves
+        #                    are more likely to have richened the quote away
+        # All off (capture=1, race_loss_prob=0, feed_lag=0) reproduces the old model.
+        self.fill_realism = bool(fill_realism)
+        self.capture = max(0.0, min(1.0, capture)) if self.fill_realism else 1.0
+        self.edge_contention = bool(edge_contention) and self.fill_realism
+        self.race_loss_prob = (max(0.0, min(1.0, race_loss_prob))
+                               if self.fill_realism else 0.0)
+        self.feed_lag = max(0.0, feed_lag_ms / 1000.0) if self.fill_realism else 0.0
         self.open_orders: dict[str, OpenOrder] = {}
         # taker orders frozen inside the speed bump: cannot be cancelled
         self._committed: set[str] = set()
@@ -465,11 +511,18 @@ class PaperExecutor:
         finally:
             self._committed.discard(oid)
 
+        # Our WS book trails the matching engine; wait the feed lag so the
+        # re-validation reflects the book the engine actually had when our order
+        # landed (favourable moves are more likely to have richened the quote
+        # away by then, and continuation moves show up as worse adverse drift).
+        if self.feed_lag > 0:
+            await asyncio.sleep(self.feed_lag)
+
         if market.close_ts <= time.time():
             self.fak_stats.record_kill()
             return  # window closed during the hold
 
-        # re-validate against the post-bump book
+        # re-validate against the (lag-adjusted) post-bump book
         book = self.feed.books.get(token)
         ask = book.best_ask() if book else None
         mid1 = self._mid(token)
@@ -488,6 +541,30 @@ class PaperExecutor:
                      self.speed_bump * 1000, drift)
             return
 
+        # Competition: faster/colocated arbs race us for this same stale quote.
+        # Sometimes they take it all before our order lands (full miss)...
+        if self.race_loss_prob > 0 and random.random() < self.race_loss_prob:
+            self.fak_stats.record_kill()
+            log.info("paper FAK lost the race: %s %s, quote %.3f taken by faster "
+                     "takers before our order landed", market.title, outcome.upper(),
+                     ask[0])
+            return
+
+        # ...otherwise we win only a FRACTION of the displayed size, and the
+        # richer (more underpriced vs mid) the quote, the more contested it is.
+        capture = self.capture
+        if self.edge_contention and mid1 is not None:
+            discount = max(0.0, mid1 - ask[0])              # how far below fair
+            contention = min(1.0, discount / self.CONTENTION_SCALE)
+            capture *= (1.0 - contention)
+        fill_sz = min(shares, ask[1] * capture)
+        if fill_sz <= self.EPS:
+            self.fak_stats.record_kill()
+            log.info("paper FAK fully contested: %s %s @ %.3f — capture ~0 of %.0f "
+                     "sh displayed (richly underpriced, so everyone races it)",
+                     market.title, outcome.upper(), ask[0], ask[1])
+            return
+
         # committed fill. We cannot escape the hold, so we take the print even
         # though the side may have cheapened against us while we were frozen.
         self.fak_stats.record_fill()
@@ -497,8 +574,12 @@ class PaperExecutor:
                      "against us during the %.0fms uncancellable hold",
                      market.title, outcome.upper(), ask[0], drift,
                      self.speed_bump * 1000)
-        self.portfolio.on_fill(market, outcome, ask[0], min(shares, ask[1]),
-                               taker=True, leg=leg)
+        if fill_sz < shares - self.EPS:
+            log.info("paper PARTIAL FILL: %s %s %.0f/%.0f sh @ %.3f "
+                     "(won %.0f%% of %.0f displayed — competition haircut)",
+                     market.title, outcome.upper(), fill_sz, shares, ask[0],
+                     100 * capture, ask[1])
+        self.portfolio.on_fill(market, outcome, ask[0], fill_sz, taker=True, leg=leg)
 
     async def place_buy(self, market: Market, outcome: str, price: float, shares: float,
                         leg: str = "mm") -> str | None:
@@ -628,6 +709,27 @@ class LiveExecutor:
         log.info("live executor ready (CLOB v2, signature_type %d, address %s..., "
                  "pre-sign %s)", signature_type, self.address[:10],
                  "on" if self._presign_enabled else "off (prewarm only)")
+
+    def collateral_balance(self, sync: bool = True) -> float:
+        """Current pUSD collateral the CLOB credits this wallet, in USDC units.
+
+        For proxy/deposit wallets (type 1/2/3) the CLOB caches the balance, so
+        we push a sync first; an EOA (type 0) is read directly. Used to seed the
+        portfolio's equity baseline from real funds instead of a config guess.
+        """
+        from py_clob_client_v2 import AssetType, BalanceAllowanceParams
+        p = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL,
+                                   signature_type=self.signature_type)
+        if sync and self.signature_type in (1, 2, 3):
+            try:
+                self.client.update_balance_allowance(p)
+            except Exception as e:  # noqa: BLE001
+                log.warning("collateral balance sync failed: %s", e)
+        ba = self.client.get_balance_allowance(p)
+        try:
+            return int(ba.get("balance", 0)) / 1e6
+        except (TypeError, ValueError):
+            return 0.0
 
     def track_markets(self, condition_ids: set[str]) -> None:
         """Keep the user websocket subscribed to all markets we trade."""

@@ -282,6 +282,19 @@ class Strategy:
         if fak is None or not fm.get("enabled", True):
             return
 
+        # Recovery valve: while paused, takers log no outcomes, so the rolling
+        # window stays frozen on the bad streak that triggered the pause and can
+        # never climb back to the resume threshold. After pause_cooldown_sec of
+        # taker inactivity, forget the stale window and re-probe (half-open).
+        if fak.decay_if_stale(fm.get("pause_cooldown_sec", 90)) and self._fak_tier >= 3:
+            self._fak_tier = 2  # half-open: resume at reduced size to re-test
+            self._scaling_reverted = True
+            self._fak_adjustments = self._fak_adjustments_for_tier(2, 0.0, fm)
+            log.warning("FAK pause cooldown elapsed (%.0fs idle) — half-open "
+                        "probe: resuming takers at tier 2 (%.2fx) to re-test "
+                        "the fill rate", fm.get("pause_cooldown_sec", 90),
+                        self._fak_adjustments.get("size_mult", 0.5))
+
         roll = fak.rolling_fill_rate()
         if roll is None:
             return
@@ -479,6 +492,13 @@ class Strategy:
         per_mkt_cap = caps["max_position_usd"]
         min_edge = c["min_edge"] + self._fak_adjustments.get("min_edge_bump", 0.0)
         snipe_cd = self._fak_adjustments.get("snipe_cooldown_sec", 10)
+        # tolerance band on the FAK limit: the signal ask with zero slack is
+        # rejected by any single uptick during the speed-bump hold, even when
+        # our fair richened too and the trade is still +EV. A couple ticks of
+        # slack recaptures those (research/analyze_taker_widen.py: ~+10pp fill
+        # rate at ~1.3c/share, all +EV) without adding adverse selection (the
+        # gate only fires on favourable moves; adverse fills happen regardless).
+        slack = c.get("limit_slack_ticks", 0) * m.tick
         imbalance = self._inventory_imbalance(m, p_up, cap=per_mkt_cap)
         max_inv = c.get("max_inventory_frac", 0.25)
         pos = self.portfolio.positions.get(m.slug)
@@ -538,11 +558,13 @@ class Strategy:
                 if (self._exposure_ok(usd)
                         and self._position_cost(m.slug) + usd <= per_mkt_cap
                         and self._cooled(m.slug, "snipe", side, snipe_cd)):
-                    log.info("SNIPE %s %s: ask %.3f + fee %.4f vs robust %.3f "
-                             "(blend %.3f, edge %.3f, $%.0f)",
-                             m.title, side.upper(), ask_px, fee, robust, fair,
-                             net_edge, usd)
-                    await self.exec.place_buy(m, side, ask_px, shares, leg="snipe")
+                    limit_px = (round_tick(min(ask_px + slack, 1.0 - m.tick), m.tick)
+                                if slack else ask_px)
+                    log.info("SNIPE %s %s: ask %.3f (limit %.3f) + fee %.4f vs "
+                             "robust %.3f (blend %.3f, edge %.3f, $%.0f)",
+                             m.title, side.upper(), ask_px, limit_px, fee, robust,
+                             fair, net_edge, usd)
+                    await self.exec.place_buy(m, side, limit_px, shares, leg="snipe")
 
     async def _scalp(self, m: Market, p_up: float, caps: dict) -> None:
         c = self.cfg["scalper"]
@@ -561,6 +583,9 @@ class Strategy:
                 or m.t_remaining > c["window_sec"] or m.t_remaining <= min_tau):
             return
         scalp_cd = self._fak_adjustments.get("scalp_cooldown_sec", 15)
+        # FAK limit slack (see _snipe). Capped at max_price so a probe never
+        # pays past the scalper's tested near-certainty band.
+        slack = c.get("limit_slack_ticks", 0) * m.tick
         for side, fair, token in (("up", p_up, m.token_up), ("dn", 1 - p_up, m.token_down)):
             if fair < c["min_prob"]:
                 continue
@@ -582,9 +607,11 @@ class Strategy:
             usd = min(caps["max_scalp_usd"], ask[0] * ask[1])
             shares = max(usd / ask[0], MIN_SHARES)
             if self._exposure_ok(usd) and self._cooled(m.slug, "scalp", side, scalp_cd):
-                log.info("SCALP %s %s @ %.3f (fair %.4f, %.0fs left)",
-                         m.title, side.upper(), ask[0], fair, m.t_remaining)
-                await self.exec.place_buy(m, side, ask[0], shares, leg="scalp")
+                limit_px = (round_tick(min(ask[0] + slack, c["max_price"]), m.tick)
+                            if slack else ask[0])
+                log.info("SCALP %s %s @ %.3f (limit %.3f, fair %.4f, %.0fs left)",
+                         m.title, side.upper(), ask[0], limit_px, fair, m.t_remaining)
+                await self.exec.place_buy(m, side, limit_px, shares, leg="scalp")
 
     # ---------- settlement (paper) ----------
 

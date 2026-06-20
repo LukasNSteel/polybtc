@@ -43,6 +43,16 @@ async def amain(args: argparse.Namespace) -> None:
     setup_logging(cfg.get("log_dir", default="logs"))
     log = logging.getLogger("main")
 
+    # Modeled taker-fee rate that gates snipe/scalp entries and is debited on
+    # every taker fill. Polymarket V2 charges crypto takers 0.07 (feesEnabled=true
+    # on live BTC markets, confirmed 2026-06-19), so default to trusting each
+    # market's advertised feeSchedule (None). Set fees.assume_taker_rate: 0.0 only
+    # if Polymarket disables fees again.
+    from . import markets as _markets
+    _markets.ASSUME_TAKER_RATE = cfg.get("fees", "assume_taker_rate", default=None)
+    log.info("modeled taker fee rate: %s",
+             "schedule" if _markets.ASSUME_TAKER_RATE is None else _markets.ASSUME_TAKER_RATE)
+
     perp_enabled = cfg.get("perp_lead", "enabled", default=True)
     coinbase_enabled = cfg.get("coinbase", "enabled", default=True)
     coinbase = (CoinbaseFeed(cfg.get("coinbase", "symbol", default="BTC-USD"))
@@ -112,6 +122,19 @@ async def amain(args: argparse.Namespace) -> None:
             presign_amount_tol=cfg.get("presign", "amount_tol", default=0.7),
             presign_max_age_sec=cfg.get("presign", "max_age_sec", default=45.0),
         )
+        # Seed the equity baseline from REAL wallet collateral, not a config
+        # guess — so the kill switch and equity-scaling reference track funded
+        # capital. (sizing.reference_equity falls back to start_cash when unset.)
+        if cfg.get("live", "seed_from_wallet", default=True):
+            bal = executor.collateral_balance()
+            if bal > 0:
+                portfolio.start_cash = bal
+                portfolio.cash = bal
+                log.info("live: seeded equity baseline from wallet collateral: "
+                         "$%.2f pUSD", bal)
+            else:
+                log.warning("live: wallet collateral read as $0 — keeping configured "
+                            "starting_cash $%.2f", portfolio.start_cash)
         tasks.append(executor.run_user_feed())
         tasks.append(executor.process_onchain())
         # pre-warm market-info caches (and, if enabled, keep the pre-signed
@@ -127,7 +150,20 @@ async def amain(args: argparse.Namespace) -> None:
             fak_min_fill_rate=cfg.get("fak_monitor", "min_fill_rate", default=0.50),
             fak_min_attempts=cfg.get("fak_monitor", "min_attempts", default=10),
             fak_window_size=cfg.get("fak_monitor", "window_size", default=30),
+            fill_realism=cfg.get("paper", "fill_realism", "enabled", default=True),
+            capture=cfg.get("paper", "fill_realism", "capture", default=0.30),
+            edge_contention=cfg.get("paper", "fill_realism", "edge_contention", default=True),
+            race_loss_prob=cfg.get("paper", "fill_realism", "race_loss_prob", default=0.20),
+            feed_lag_ms=cfg.get("paper", "fill_realism", "feed_lag_ms", default=150),
         )
+        if executor.fill_realism:
+            log.info("paper fill-realism ON: capture %.0f%% of displayed size, "
+                     "edge-contention %s, race-loss %.0f%%, feed-lag %.0fms",
+                     executor.capture * 100, "on" if executor.edge_contention else "off",
+                     executor.race_loss_prob * 100, executor.feed_lag * 1000)
+        else:
+            log.warning("paper fill-realism OFF: snipes win full displayed size "
+                        "uncontested — paper PnL will overstate live.")
         log.info("paper mode: simulated fills against live books "
                  "(taker latency %.0fms incl. %.0fms uncancellable speed bump, "
                  "cancel latency %.0fms)",

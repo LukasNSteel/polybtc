@@ -179,10 +179,15 @@ def build_payload(session: str | None) -> dict:
         ls["pnl"] += r.pnl
         ls["wins" if r.won else "losses"] += 1
         ks = kind_stats.setdefault(market_kind(r.market),
-                                   {"markets": set(), "cost": 0.0, "pnl": 0.0})
+                                   {"markets": set(), "cost": 0.0, "pnl": 0.0,
+                                    "win": 0.0, "loss": 0.0})
         ks["markets"].add(r.market)
         ks["cost"] += r.cost
         ks["pnl"] += r.pnl
+        if r.pnl >= 0:
+            ks["win"] += r.pnl
+        else:
+            ks["loss"] += r.pnl
     for ks in kind_stats.values():
         ks["markets"] = len(ks["markets"])
     for d in leg_stats.values():
@@ -191,6 +196,8 @@ def build_payload(session: str | None) -> dict:
     for d in kind_stats.values():
         d["cost"] = round(d["cost"], 2)
         d["pnl"] = round(d["pnl"], 2)
+        d["win"] = round(d["win"], 2)
+        d["loss"] = round(d["loss"], 2)
 
     # ---- activity feed (merged, newest first) ----
     feed = []
@@ -221,6 +228,42 @@ def build_payload(session: str | None) -> dict:
     # ---- settlement pnl distribution ----
     pnl_hist = [round(s.pnl, 2) for s in snap.settlements]
 
+    # ---- win/loss by entry-price bucket (0.05-wide) ----
+    PRICE_BUCKET = 0.05
+    price_buckets: dict[int, dict] = {}
+    for r in legs:
+        if r.shares <= 0:
+            continue
+        price = r.cost / r.shares  # effective entry price incl. fees
+        idx = max(0, min(19, int(price / PRICE_BUCKET)))
+        pb = price_buckets.setdefault(idx, {"n": 0, "wins": 0, "losses": 0,
+                                            "cost": 0.0, "pnl": 0.0,
+                                            "win": 0.0, "loss": 0.0})
+        pb["n"] += 1
+        pb["cost"] += r.cost
+        pb["pnl"] += r.pnl
+        if r.pnl >= 0:
+            pb["wins"] += 1
+            pb["win"] += r.pnl
+        else:
+            pb["losses"] += 1
+            pb["loss"] += r.pnl
+    price_bucket_stats = []
+    for idx in sorted(price_buckets):
+        pb = price_buckets[idx]
+        lo = idx * PRICE_BUCKET
+        price_bucket_stats.append({
+            "lo": round(lo, 2),
+            "hi": round(lo + PRICE_BUCKET, 2),
+            "n": pb["n"],
+            "wins": pb["wins"],
+            "losses": pb["losses"],
+            "cost": round(pb["cost"], 2),
+            "pnl": round(pb["pnl"], 2),
+            "win": round(pb["win"], 2),
+            "loss": round(pb["loss"], 2),
+        })
+
     # ---- market close boundaries (vertical chart guides) ----
     ts_points = [ep(s.ts) for s in snap.status]
     if snap.settlements:
@@ -243,6 +286,7 @@ def build_payload(session: str | None) -> dict:
         "feed": feed[:120],
         "positions": positions,
         "pnl_hist": pnl_hist,
+        "price_buckets": price_bucket_stats,
         "close_lines_by_kind": close_lines_by_kind,
         "state": {
             "cash": state.cash if state else None,
@@ -264,7 +308,7 @@ async def index(_: web.Request) -> web.FileResponse:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--port", type=int, default=8787)
+    ap.add_argument("--port", type=int, default=8789)
     ap.add_argument("--host", default="127.0.0.1")
     args = ap.parse_args()
     app = web.Application()

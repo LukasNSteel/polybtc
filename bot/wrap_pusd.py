@@ -67,6 +67,8 @@ def main() -> None:
         raise SystemExit("set POLYMARKET_PRIVATE_KEY in .env first")
 
     w3 = Web3(Web3.HTTPProvider(args.rpc, request_kwargs={"timeout": 20}))
+    from web3.middleware import ExtraDataToPOAMiddleware  # Polygon is POA
+    w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
     acct = w3.eth.account.from_key(key)
     eoa = acct.address
     usdce = w3.eth.contract(address=Web3.to_checksum_address(USDCE), abi=ERC20_ABI)

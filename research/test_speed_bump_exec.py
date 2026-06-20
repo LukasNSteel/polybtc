@@ -58,9 +58,14 @@ def make_market(close_in=60.0):
 
 def make_executor(feed):
     pf = Portfolio(starting_cash=1000.0)
-    # tiny latencies so tests run fast but keep the 2:1 pre-bump:bump ratio
+    # tiny latencies so tests run fast but keep the 2:1 pre-bump:bump ratio.
+    # Disable the fill-realism knobs (race loss, contention, feed lag) so the
+    # hold/reject/adverse mechanics under test resolve deterministically and on
+    # the original timing budget (feed_lag would otherwise push resolution past
+    # the tests' fixed sleeps).
     return PaperExecutor(pf, feed, taker_latency_ms=60.0, speed_bump_ms=40.0,
-                         cancel_latency_ms=20.0)
+                         cancel_latency_ms=20.0, capture=1.0, edge_contention=False,
+                         race_loss_prob=0.0, feed_lag_ms=0.0)
 
 
 PASS, FAIL = "PASS", "FAIL"

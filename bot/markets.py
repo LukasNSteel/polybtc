@@ -14,6 +14,17 @@ GAMMA = "https://gamma-api.polymarket.com"
 CLOB = "https://clob.polymarket.com"
 HOURLY_SERIES_ID = "10114"  # btc-up-or-down-hourly
 
+# Override for the modeled taker-fee rate used to gate snipe/scalp entries and
+# debited on every taker fill. When None, each market's advertised feeSchedule is
+# used (rate 0.07, exponent 1 for crypto). main() sets this from config
+# (fees.assume_taker_rate); set 0.0 there only if Polymarket disables fees again.
+#
+# Polymarket V2 charges crypto takers 0.07 (confirmed 2026-06-19: live BTC
+# markets return feesEnabled=true, feeSchedule rate 0.07). The fee is deducted
+# from balance at match time, not from the fill price, so it is invisible in the
+# fill-leg ratio (which is why an earlier check mistakenly read it as $0).
+ASSUME_TAKER_RATE: float | None = None
+
 
 @dataclass
 class Market:
@@ -54,6 +65,9 @@ def _parse_market(e: dict, kind: str, interval: str, open_ts: int, close_ts: int
     up_idx = outcomes.index("Up")
     dn_idx = 1 - up_idx
     fs = m.get("feeSchedule") or {}
+    rate = float(fs.get("rate", 0.07)) if m.get("feesEnabled") else 0.0
+    if ASSUME_TAKER_RATE is not None:
+        rate = ASSUME_TAKER_RATE
     return Market(
         slug=e["slug"],
         title=e["title"],
@@ -66,7 +80,7 @@ def _parse_market(e: dict, kind: str, interval: str, open_ts: int, close_ts: int
         kind=kind,
         interval=interval,
         neg_risk=bool(m.get("negRisk", False)),
-        fee_rate=float(fs.get("rate", 0.07)) if m.get("feesEnabled") else 0.0,
+        fee_rate=rate,
         fee_exponent=float(fs.get("exponent", 1.0)),
         accepting=True,
     )

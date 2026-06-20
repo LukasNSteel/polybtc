@@ -135,7 +135,7 @@
     <div class="panel">
       <h2>P&amp;L by market kind</h2>
       <table id="kind-table">
-        <thead><tr><th>kind</th><th class="num">markets</th><th class="num">cost</th><th class="num">pnl</th><th class="num">ret</th></tr></thead>
+        <thead><tr><th>kind</th><th class="num">markets</th><th class="num">cost</th><th class="num">$win</th><th class="num">$loss</th><th class="num">pnl</th><th class="num">ret</th></tr></thead>
         <tbody></tbody>
       </table>
     </div>
@@ -151,6 +151,10 @@
     <div class="panel">
       <h2>Settlement P&amp;L distribution</h2>
       <div class="chart-wrap short"><canvas id="hist-chart"></canvas></div>
+    </div>
+    <div class="panel">
+      <h2>P&amp;L by entry price <small id="price-sub"></small></h2>
+      <div class="chart-wrap short"><canvas id="price-chart"></canvas></div>
     </div>
   </div>
 </div>
@@ -295,10 +299,13 @@ function renderKinds(stats) {
   $("kind-table").querySelector("tbody").innerHTML = kinds.map((k) => {
     const s = stats[k];
     const ret = s.cost ? (100 * s.pnl / s.cost).toFixed(1) + "%" : "—";
+    const win = s.win ?? 0, loss = s.loss ?? 0;
     return `<tr><td>${k}</td><td class="num">${s.markets}</td><td class="num">$${s.cost.toFixed(0)}</td>
+      <td class="num ${cls(win)}">${win > 0 ? "+" : ""}${win.toFixed(2)}</td>
+      <td class="num ${cls(loss)}">${loss.toFixed(2)}</td>
       <td class="num ${cls(s.pnl)}">${s.pnl > 0 ? "+" : ""}${s.pnl.toFixed(2)}</td>
       <td class="num ${cls(s.pnl)}">${ret}</td></tr>`;
-  }).join("") || `<tr><td colspan="5" class="muted">no settled markets yet</td></tr>`;
+  }).join("") || `<tr><td colspan="7" class="muted">no settled markets yet</td></tr>`;
 }
 
 function renderPositions(pos) {
@@ -326,6 +333,52 @@ function renderHist(pnls) {
     data: { labels, datasets: [{ data: bins, backgroundColor: colors, borderRadius: 2 }] },
     options: { maintainAspectRatio: false,
       scales: { x: { ticks: { maxTicksLimit: 9 }, grid: { display: false } }, y: { grid: { color: "#161c2b" } } } },
+  });
+}
+
+function renderPriceBuckets(buckets) {
+  buckets = buckets || [];
+  const sub = $("price-sub");
+  if (!buckets.length) {
+    if (sub) sub.textContent = "";
+    if (charts["price-chart"]) { charts["price-chart"].destroy(); delete charts["price-chart"]; }
+    return;
+  }
+  const labels = buckets.map((b) => `${b.lo.toFixed(2)}-${b.hi.toFixed(2)}`);
+  const wins = buckets.map((b) => b.win);
+  const losses = buckets.map((b) => b.loss);
+  const meta = buckets;
+  if (sub) {
+    const tn = buckets.reduce((a, b) => a + b.n, 0);
+    sub.textContent = `${tn} legs · 0.05 buckets`;
+  }
+  const tooltip = {
+    callbacks: {
+      afterBody: (items) => {
+        const b = meta[items[0].dataIndex];
+        return `net ${b.pnl >= 0 ? "+" : ""}${b.pnl.toFixed(2)} · ${b.wins}W/${b.losses}L · ${b.n} legs`;
+      },
+    },
+  };
+  if (charts["price-chart"]) {
+    const c = charts["price-chart"];
+    c.data.labels = labels;
+    c.data.datasets[0].data = wins;
+    c.data.datasets[1].data = losses;
+    c.options.plugins.tooltip = tooltip;
+    c.update("none");
+    return;
+  }
+  charts["price-chart"] = new Chart($("price-chart"), {
+    type: "bar",
+    data: { labels, datasets: [
+      { label: "$win", data: wins, backgroundColor: "#2dd4a0", borderRadius: 2, stack: "pnl" },
+      { label: "$loss", data: losses, backgroundColor: "#f3655b", borderRadius: 2, stack: "pnl" },
+    ] },
+    options: { maintainAspectRatio: false,
+      plugins: { legend: { display: true, labels: { boxWidth: 10 } }, tooltip },
+      scales: { x: { stacked: true, ticks: { maxTicksLimit: 11 }, grid: { display: false } },
+                y: { stacked: true, grid: { color: "#161c2b" } } } },
   });
 }
 
@@ -398,6 +451,7 @@ async function refresh() {
     renderKinds(d.kind_stats);
     renderPositions(d.positions);
     renderHist(d.pnl_hist);
+    renderPriceBuckets(d.price_buckets);
   } catch (e) {
     $("err").textContent = "dashboard server unreachable: " + e.message;
     $("err").style.display = "block";
