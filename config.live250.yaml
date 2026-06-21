@@ -157,10 +157,11 @@ sniper:
   enabled: true
   min_edge: 0.10               # gate on the dual-beta ROBUST edge (worst-case
                                # P across both regimes)
-  max_edge: 0.25               # winner's-curse veto, REINSTATED: a giant edge
-                               # still on the book 350ms after the move is one
-                               # the fast bots passed on. Our live edge>=0.15
-                               # fills went 0-for-5 (-104%/$1).
+  max_edge: 0.20               # winner's-curse veto, TIGHTENED 0.25->0.20 (Binance
+                               # replay w/ contention+feed_lag: same PnL, ~1/3 less
+                               # drawdown). A giant edge still on the book 350ms
+                               # after the move is one the fast bots passed on;
+                               # live edge>=0.15 fills went 0-for-5 (-104%/$1).
   robust_betas: [0.83, 1.36]   # lead-stickiness regimes fitted per-day on 1,847
                                # markets: ~0.8-0.9 mean-reversion days, ~1.2-1.4
                                # momentum days. Entry must be +EV under BOTH.
@@ -171,7 +172,9 @@ sniper:
   max_ask: 0.80                # above this the snipe edge was fee-dead live
                                # (-21.6%); near-certainty buys belong to the
                                # scalper and its 0.997 probability gate
-  max_take_usd: 25             # $250 tier: ~10% of bankroll per single take
+  max_take_usd: 20             # $250 tier: trimmed 25->20 to sit at/below the
+                               # median late-window ask liquidity (already small;
+                               # this tier was the profitable one in the study)
                                # (was 100 at the $1k tier)
   max_position_usd: 40         # per-market snipe cost cap (~16% of bankroll;
                                # was 150 at the $1k tier)

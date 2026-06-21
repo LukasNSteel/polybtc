@@ -148,10 +148,12 @@ sniper:
   enabled: true
   min_edge: 0.10               # gate on the dual-beta ROBUST edge (worst-case
                                # P across both regimes)
-  max_edge: 0.25               # winner's-curse veto, REINSTATED: a giant edge
-                               # still on the book 350ms after the move is one
-                               # the fast bots passed on. Our live edge>=0.15
-                               # fills went 0-for-5 (-104%/$1).
+  max_edge: 0.20               # winner's-curse veto, TIGHTENED 0.25->0.20: with
+                               # edge_contention+feed_lag modeled, the Binance
+                               # replay shows 0.20 keeps ~all the PnL of 0.25 but
+                               # cuts max drawdown ~1/3 (pnl/DD 3.0 vs 2.0). A
+                               # giant edge still on the book is one the fast bots
+                               # passed on; live edge>=0.15 fills went 0-for-5.
   robust_betas: [0.83, 1.36]   # lead-stickiness regimes fitted per-day on 1,847
                                # markets: ~0.8-0.9 mean-reversion days, ~1.2-1.4
                                # momentum days. Entry must be +EV under BOTH.
@@ -162,10 +164,11 @@ sniper:
   max_ask: 0.80                # above this the snipe edge was fee-dead live
                                # (-21.6%); near-certainty buys belong to the
                                # scalper and its 0.997 probability gate
-  max_take_usd: 100            # capacity is there: median ~$650 printed notional
-                               # per qualifying 5m market in the edge bucket
-  max_position_usd: 150        # per-market snipe cost cap (decoupled from the
-                               # now-disabled MM leg's cap)
+  max_take_usd: 30             # cut from 100: the cross-method study (paper-log
+                               # resize, 8-week parquet liquidity, Binance replay)
+                               # showed big takes are adversely selected and
+                               # unfillable late; ~$30 ~ median late ask liquidity
+  max_position_usd: 60         # cut from 150: ~2 takes/market; caps the loss tail
   max_inventory_frac: 0.25     # skip a side once net same-side inventory exceeds
                                # this fraction of max_position_usd: stacking one
                                # side on the same lagging signal built every
@@ -235,9 +238,10 @@ guards:
   markout_horizons_sec: [10, 60]
 
 risk:
-  max_total_exposure_usd: 500  # base exposure cap; scales with equity up to ceiling
-  max_total_exposure_ceiling: 500  # hard book ceiling (never exceed even when scaled up)
-  kill_switch_loss_usd: 300    # floor: minimum absolute session drawdown stop
+  max_total_exposure_usd: 200  # cut from 500: deployment is opportunity-limited,
+                               # not capital-limited; bigger book only added variance
+  max_total_exposure_ceiling: 200  # hard book ceiling (never exceed even when scaled up)
+  kill_switch_loss_usd: 100    # cut from 300: drawdowns are far smaller at the new caps
   kill_switch_loss_frac: 0.30 # session drawdown stop = this fraction of session-start equity
   kill_switch_loss_cap_usd: 500  # ceiling on the proportional kill limit
   max_feed_age_sec: 5          # pull all quotes if the price feed stalls this long
@@ -258,8 +262,9 @@ sizing:
   min_scale: 0.5               # never shrink below 50% of base caps on drawdown
   equity_tiers: [2500, 5000, 10000]   # step mode only
   tier_multipliers: [1.0, 1.25, 1.5, 2.0]  # below $2.5k, then each tier
-  max_take_usd_cap: 500        # absolute ceiling on scaled snipe/scalp takes
-  max_position_usd_cap: 500    # absolute ceiling on per-market snipe cost
+  max_take_usd_cap: 90         # cut from 500 so equity-scaling can't re-inflate
+                               # takes back into the adversely-selected size range
+  max_position_usd_cap: 120    # cut from 500 (matches the tightened per-market cap)
   scale_exposure: true         # scale max_total_exposure_usd with equity scale
 
 presign:
