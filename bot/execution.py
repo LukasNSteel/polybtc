@@ -681,10 +681,14 @@ class LiveExecutor:
                  presign_price_radius_ticks: int = 1,
                  presign_amount_buckets_usd: tuple | None = None,
                  presign_amount_tol: float = 0.7,
-                 presign_max_age_sec: float = 45.0):
+                 presign_max_age_sec: float = 45.0,
+                 shadow=None):
         from py_clob_client_v2 import ClobClient
 
         self.portfolio = portfolio
+        # optional ShadowTakerLogger: records seen-book/latency/fill-capture/
+        # markouts on every live taker FAK (ROADMAP P0.2). Pure observation.
+        self.shadow = shadow
         kwargs = {"key": private_key, "chain_id": chain_id,
                   "signature_type": signature_type}
         if funder:  # EOA (type 0) holds funds itself; only proxies need a funder
@@ -784,6 +788,27 @@ class LiveExecutor:
                 except Exception as e:
                     log.warning("redeem failed for %s: %s", m.title, e)
 
+    @staticmethod
+    def _stamp_taker_timing(attempt: dict | None, t_build0: float,
+                            t_build1: float | None, presigned: bool) -> None:
+        """Record, into the shadow attempt, the split of submit->ack latency:
+        BUILD (order construction/sign, or a pre-signed lookup) vs POST (the
+        post_order HTTP round trip). build_ms is None if create_market_order
+        itself raised before completing. Pure observation — never raises."""
+        try:
+            now = time.monotonic()
+            build_ms = round((t_build1 - t_build0) * 1000, 1) if t_build1 else None
+            post_ms = round((now - t_build1) * 1000, 1) if t_build1 else None
+            log.info("TAKER TIMING build %s post %s presigned=%s",
+                     f"{build_ms:.0f}ms" if build_ms is not None else "n/a",
+                     f"{post_ms:.0f}ms" if post_ms is not None else "n/a", presigned)
+            if attempt is not None:
+                attempt["build_ms"] = build_ms
+                attempt["post_ms"] = post_ms
+                attempt["presigned"] = bool(presigned)
+        except Exception as e:  # noqa: BLE001 — never let instrumentation break a trade
+            log.debug("taker timing stamp failed: %s", e)
+
     async def place_buy(self, market: Market, outcome: str, price: float, shares: float,
                         leg: str = "mm") -> str | None:
         from py_clob_client_v2 import (
@@ -826,11 +851,22 @@ class LiveExecutor:
         if amount <= 0:
             return None
         self.fak_stats.record_attempt()
+        # shadow logger: snapshot the book we're acting on and start the latency
+        # clock right before submission (ROADMAP P0.2). No-op if not wired.
+        shadow_attempt = (self.shadow.on_submit(market, outcome, token, price, shares, leg)
+                          if self.shadow is not None else None)
         # fast path: a pre-signed order whose stake bucket is <= the desired
         # stake (never oversizes) and within tolerance keeps EIP-712 signing
         # off the critical path — fire is then just the HTTP POST below.
         used_amount = amount
         presigned = self._take_presigned(token, price, amount) if self._presign_enabled else None
+        # Split the submit->ack latency into BUILD (create_market_order, the
+        # client-side market-info/sizing/sign step — or a pre-signed lookup) vs
+        # POST (the post_order HTTP round trip). The shadow log showed ~1.5s of
+        # submit latency against a ~1ms network RTT, so we need to know which
+        # of the two owns it. presigned=true rows isolate the POST-only cost.
+        t_build0 = time.monotonic()
+        t_build1 = None
         try:
             if presigned is not None:
                 signed, used_amount = presigned
@@ -840,16 +876,24 @@ class LiveExecutor:
                     MarketOrderArgs(token_id=token, amount=used_amount, side=Side.BUY,
                                     price=price, order_type=OrderType.FAK),
                     opts)
+            t_build1 = time.monotonic()
             resp = await asyncio.to_thread(self.client.post_order, signed, OrderType.FAK)
         except Exception as e:
+            self._stamp_taker_timing(shadow_attempt, t_build0, t_build1, presigned is not None)
             log.warning("taker order rejected: %s", e)
             self.fak_stats.record_kill()
+            if self.shadow is not None:
+                self.shadow.on_result(shadow_attempt, 0.0, 0.0, f"rejected: {e}")
             return None
+        self._stamp_taker_timing(shadow_attempt, t_build0, t_build1, presigned is not None)
         requested = used_amount / price if price > 0 else shares
         filled = _parse_fill_shares(resp, requested)
+        avg = _parse_fill_price(resp, price) if filled > 0 else 0.0
+        if self.shadow is not None:
+            status = str(resp.get("status")) if isinstance(resp, dict) else "no-fill"
+            self.shadow.on_result(shadow_attempt, filled, avg, status)
         if filled > 0:
             self.fak_stats.record_fill()
-            avg = _parse_fill_price(resp, price)
             self._log_fee_ground_truth(market, outcome, avg, filled, resp)
             self.portfolio.on_fill(market, outcome, avg, filled, taker=True, leg=leg)
         else:

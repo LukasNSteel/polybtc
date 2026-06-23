@@ -308,7 +308,7 @@ async def index(_: web.Request) -> web.FileResponse:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--port", type=int, default=8789)
+    ap.add_argument("--port", type=int, default=8787)
     ap.add_argument("--host", default="127.0.0.1")
     args = ap.parse_args()
     app = web.Application()

@@ -176,6 +176,59 @@ class MarketManager:
             if self.active[slug].t_remaining < -2:
                 self.expired.append(self.active.pop(slug))
 
+    async def resolved_outcome(self, market: Market) -> bool | None:
+        """Real Polymarket resolution for a closed market: True if Up won,
+        False if Down won, None if not yet resolved.
+
+        This is the GROUND TRUTH (Chainlink/UMA), NOT our Binance kline proxy.
+        5m/15m/4h markets resolve on Chainlink BTC/USD and hourly on the
+        Binance 1h candle; on a coin-flip close the Binance proxy disagrees
+        with the real source (basis risk), and settling on the wrong winner
+        makes live P&L fiction. Reads the CLOB market's per-token `winner`
+        flag first (matched by token id), falling back to Gamma
+        `outcomePrices` aligned to the outcome labels."""
+        cid = market.condition_id
+        async with aiohttp.ClientSession() as s:
+            if cid:
+                try:
+                    async with s.get(f"{CLOB}/markets/{cid}",
+                                     timeout=aiohttp.ClientTimeout(total=6)) as r:
+                        d = await r.json()
+                    if d.get("closed"):
+                        for t in d.get("tokens", []):
+                            if not t.get("winner"):
+                                continue
+                            tid = str(t.get("token_id"))
+                            if tid == str(market.token_up):
+                                return True
+                            if tid == str(market.token_down):
+                                return False
+                            out = (t.get("outcome") or "").strip().lower()
+                            if out == "up":
+                                return True
+                            if out == "down":
+                                return False
+                except Exception as e:
+                    log.debug("CLOB resolution fetch failed for %s: %s", market.title, e)
+            try:
+                async with s.get(f"{GAMMA}/events", params={"slug": market.slug},
+                                 timeout=aiohttp.ClientTimeout(total=6)) as r:
+                    evs = await r.json()
+                m = evs[0]["markets"][0]
+                resolved = m.get("closed") or \
+                    str(m.get("umaResolutionStatus", "")).lower() == "resolved"
+                if resolved:
+                    outcomes = json.loads(m["outcomes"])
+                    prices = [float(p) for p in json.loads(m["outcomePrices"])]
+                    up_price = prices[outcomes.index("Up")]
+                    if up_price >= 0.99:
+                        return True
+                    if up_price <= 0.01:
+                        return False
+            except Exception as e:
+                log.debug("Gamma resolution fetch failed for %s: %s", market.title, e)
+        return None
+
     async def run(self, interval_sec: float = 5.0) -> None:
         while True:
             try:

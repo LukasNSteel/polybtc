@@ -188,6 +188,19 @@ sniper:
   min_t_rem_sec: 0             # 0 = trade down to settlement. Don't push above
                                # ~10s: the final-seconds edge is real live but
                                # model-unstable in backtest (vol*sqrt(t)->0).
+  # SETTLEMENT-SAFETY CUTOFF: refuse to snipe inside the final N seconds before
+  # close, where the book gaps as the outcome resolves and a marketable FAK
+  # fills the collapsing side below the quoted ask (against the favourite the
+  # min_ask gate is meant to enforce). Distinct from min_t_rem_sec; composes
+  # with it (effective floor = larger of the two). Per-kind overrides global.
+  close_buffer_sec: 20
+  close_buffer_sec_5m: 20
+  close_buffer_sec_15m: 25
+  close_buffer_sec_hourly: 45
+  close_buffer_sec_4h: 60
+  max_book_age_sec: 3          # never snipe off a WS book older than this; the
+                               # favourite gate only means something on a current
+                               # book (was an implicit 15s).
   max_inventory_frac: 0.25     # skip a side once net same-side inventory exceeds
                                # this fraction of max_position_usd: stacking one
                                # side on the same lagging signal built every
@@ -382,6 +395,14 @@ live:
   # 401, so default to publicnode; swap in a private RPC (Alchemy/Infura) for
   # production reliability from your Dublin box.
   polygon_rpc: https://polygon-bor-rpc.publicnode.com
+
+shadow:
+  # Shadow latency / fill-capture logger (live only): per-FAK seen-book, submit
+  # ->ack latency, fill capture, slippage and post-fill markouts to
+  # logs/shadow_taker.jsonl. Ground truth for the assumed taker latency/capture
+  # knobs (ROADMAP P0.2). Pure observation. Analyse: research/analyze_shadow.py.
+  enabled: true
+  markout_horizons_sec: [2, 10]
 
 log_dir: logs
 state_file: state.json   # positions/cash survive restarts (run with --fresh to ignore)

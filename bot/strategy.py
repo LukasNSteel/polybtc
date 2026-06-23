@@ -44,6 +44,10 @@ class Strategy:
         self._session_start_equity: float | None = None
         self._last_status = 0.0
         self._last_calib = 0.0
+        self._last_reconcile = 0.0
+        # live settlement: per-market last resolution-poll time, so a not-yet-
+        # resolved expired market isn't hammered against the CLOB every tick
+        self._resolve_checks: dict[str, float] = {}
         self._fak_tier = 0  # 0=ok, 1=soft adjust, 2=hard adjust, 3=paused
         self._fak_adjustments: dict = {
             "size_mult": 1.0, "min_edge_bump": 0.0,
@@ -98,6 +102,21 @@ class Strategy:
         self.markouts.record_fill(token, price, leg, now)
         if leg == "mm" and not taker:
             self.fill_guards.record_fill(market.slug, outcome, now, market.title)
+        # favourite-only enforcement, checked on the REALIZED fill (not just the
+        # displayed ask the snipe gate saw). A snipe filling below min_ask means
+        # the book collapsed during order latency and we landed on the underdog
+        # — a bet against the favourite. The marketable FAK can't be unwound, so
+        # this is a loud, counted alert; tighten close_buffer_sec/max_book_age_sec
+        # if it recurs.
+        if taker and leg == "snipe":
+            min_ask = self.cfg.get("sniper", "min_ask", default=0.50)
+            if price < min_ask:
+                log.warning(
+                    "ADVERSE SNIPE FILL %s %s: filled @ %.3f, BELOW favourite "
+                    "floor (min_ask %.2f) — book collapsed in-flight and the FAK "
+                    "landed on the underdog. This is a bet against the market "
+                    "favourite; tighten sniper.close_buffer_sec / max_book_age_sec.",
+                    market.title, outcome.upper(), price, min_ask)
 
     def _token_mid(self, token: str) -> float | None:
         book = self.feed.books.get(token)
@@ -340,6 +359,31 @@ class Strategy:
             return per_kind
         return self.cfg.get("sniper", "max_t_rem_sec", default=0) or 0
 
+    def _close_buffer_sec(self, m: Market) -> float:
+        """Settlement-safety cutoff: refuse to snipe inside the final N seconds
+        before a window closes. This is NOT the late-window EDGE gate
+        (max/min_t_rem_sec) — it is a separate guard against the settlement gap.
+
+        In the last few seconds the order book gaps as the outcome resolves. A
+        marketable FAK sized/priced off the book the strategy *saw* then lands
+        ~100ms+ later against a book that has already collapsed, so it fills the
+        losing side far BELOW the quoted ask — i.e. on the underdog the
+        favourite-only `min_ask` gate is meant to exclude. The gate reads the
+        pre-collapse displayed ask and passes; the fill is adverse. (Live
+        session 1782200216: UP sniped on a 0.50 quote filled 0.35 ~3s before
+        close, DN on a 0.73 quote filled 0.19 ~1s before close; both settled
+        against us.) The favourite-only rule can only hold if we never take into
+        the settlement gap. Mirrors the scalper's min_tau_sec resolution buffer.
+
+        Per-kind key close_buffer_sec_{5m,15m,hourly,4h} overrides the global
+        close_buffer_sec; 0/unset = no buffer (legacy behaviour)."""
+        key = {"5m": "close_buffer_sec_5m", "15m": "close_buffer_sec_15m",
+               "4h": "close_buffer_sec_4h"}.get(m.kind, "close_buffer_sec_hourly")
+        per_kind = self.cfg.get("sniper", key, default=None)
+        if per_kind is not None:
+            return per_kind
+        return self.cfg.get("sniper", "close_buffer_sec", default=0) or 0
+
     def _tradable(self, m: Market) -> bool:
         """Polymarket halts some markets before expiry; also apply our own cutoff."""
         return m.accepting and m.t_remaining > self._cutoff_sec(m)
@@ -519,6 +563,19 @@ class Strategy:
         min_t_rem = c.get("min_t_rem_sec")
         if min_t_rem and m.t_remaining < min_t_rem:
             return
+        # settlement-safety cutoff: never take into the final-seconds book gap,
+        # where a FAK fills the collapsing side below the quoted ask (i.e. the
+        # underdog the min_ask favourite gate is meant to exclude). See
+        # _close_buffer_sec. Composes with min_t_rem_sec: effective floor is the
+        # larger of the two.
+        close_buffer = self._close_buffer_sec(m)
+        if close_buffer and m.t_remaining < close_buffer:
+            if self._cooled(m.slug, "snipe-close-buffer", "all", 30):
+                log.info("SNIPE SKIP %s: %.0fs to close < %.0fs buffer — book "
+                         "gaps into settlement; a FAK here fills the collapsing "
+                         "side below the quoted ask (against the favourite)",
+                         m.title, m.t_remaining, close_buffer)
+            return
         per_mkt_cap = caps["max_position_usd"]
         min_edge = c["min_edge"] + self._fak_adjustments.get("min_edge_bump", 0.0)
         snipe_cd = self._fak_adjustments.get("snipe_cooldown_sec", 10)
@@ -549,7 +606,13 @@ class Strategy:
             opposite = (pos.dn if side == "up" else pos.up) if pos else 0.0
             if opposite > 1.0:
                 continue
-            if not self._book_fresh(token):
+            # the favourite gate (min_ask) reads the displayed ask, so it is
+            # only meaningful on a CURRENT book. A stale snapshot is how a
+            # pre-collapse 0.50/0.73 ask passes the gate while the live book is
+            # already deep underdog. Hold the sniper to a tight freshness window
+            # (default 3s, was an implicit 15s); the close buffer covers the
+            # sub-second gap the freshness check can't see.
+            if not self._book_fresh(token, c.get("max_book_age_sec", 15.0)):
                 continue  # never take against a possibly-stale view of the book
             book = self.feed.books.get(token)
             ask = book.best_ask() if book else None
@@ -643,27 +706,77 @@ class Strategy:
                          m.title, side.upper(), ask[0], limit_px, fair, m.t_remaining)
                 await self.exec.place_buy(m, side, limit_px, shares, leg="scalp")
 
-    # ---------- settlement (paper) ----------
+    # ---------- settlement ----------
+
+    async def _market_outcome(self, m: Market) -> bool | None:
+        """True if Up won, False if Down, None if not resolvable yet.
+
+        LIVE: the REAL Polymarket resolution (Chainlink/UMA via the CLOB/Gamma
+        APIs) — never the Binance kline, which disagrees on coin-flip closes
+        (basis risk) and would book the wrong winner into real P&L.
+        PAPER: the Binance close-vs-open proxy is the simulator's own truth."""
+        if not self.paper:
+            return await self.markets.resolved_outcome(m)
+        if m.open_price is None:  # e.g. position restored after a restart
+            m.open_price = await self.binance.kline_open(m.interval, m.open_ts)
+        close = await self.binance.kline_close(m.interval, m.open_ts)
+        if close is None or m.open_price is None:
+            return None
+        return close >= m.open_price
 
     async def _settle_expired(self) -> None:
         still_waiting = []
+        now = time.time()
+        poll_sec = self.cfg.get("live", "resolve_poll_sec", default=10)
         for m in self.markets.expired:
-            if m.open_price is None:  # e.g. position restored after a restart
-                m.open_price = await self.binance.kline_open(m.interval, m.open_ts)
-            close = await self.binance.kline_close(m.interval, m.open_ts)
-            if close is None or m.open_price is None:
+            # live: real resolution lags the close (oracle), so poll each
+            # waiting market at most every poll_sec instead of every 0.25s tick
+            if not self.paper:
+                if now - self._resolve_checks.get(m.slug, 0.0) < poll_sec:
+                    still_waiting.append(m)
+                    continue
+                self._resolve_checks[m.slug] = now
+            up_won = await self._market_outcome(m)
+            if up_won is None:
                 # keep retrying long enough for restored positions to resolve
-                if time.time() - m.close_ts < 24 * 3600:
+                if now - m.close_ts < 24 * 3600:
                     still_waiting.append(m)
                 continue
-            up_won = close >= m.open_price
             self.portfolio.settle(m, up_won)
             self._calib_write(f"{int(time.time())},{m.kind},{m.slug},0,,,{1 if up_won else 0}")
             if hasattr(self.exec, "queue_redeem"):
                 self.exec.queue_redeem(m)
             self.quotes.pop(m.slug, None)
             self.fill_guards.drop_market(m.slug)
+            self._resolve_checks.pop(m.slug, None)
         self.markets.expired = still_waiting
+
+    async def _reconcile_wallet(self, now: float, marks: dict) -> None:
+        """LIVE: periodically compare the bot's internal cash against the REAL
+        wallet pUSD collateral. Settlement now books the real Polymarket
+        resolution, so the two should track closely; a large/growing gap means
+        the books are drifting from reality (a settlement or redemption bug)
+        and is surfaced loudly here. Read off-thread + throttled so it never
+        sits on the strategy hot path. Pure observability — does not trade."""
+        if self.paper or not hasattr(self.exec, "collateral_balance"):
+            return
+        if now - self._last_reconcile < self.cfg.get("live", "reconcile_sec", default=30):
+            return
+        self._last_reconcile = now
+        try:
+            bal = await asyncio.to_thread(self.exec.collateral_balance)
+        except Exception as e:  # noqa: BLE001 — a balance read must never stop trading
+            log.warning("reconcile: wallet collateral read failed: %s", e)
+            return
+        if not bal or bal <= 0:
+            return
+        open_val = sum(p.up * marks.get(s, 0.5) + p.dn * (1 - marks.get(s, 0.5))
+                       for s, p in self.portfolio.positions.items())
+        div = self.portfolio.cash - bal
+        warn_usd = self.cfg.get("live", "reconcile_warn_usd", default=10.0)
+        emit = log.warning if abs(div) > warn_usd else log.info
+        emit("RECONCILE bot cash $%.2f vs wallet collateral $%.2f (divergence "
+             "%+.2f) | open positions $%.2f", self.portfolio.cash, bal, div, open_val)
 
     # ---------- main loop ----------
 
@@ -804,6 +917,7 @@ class Strategy:
             return
 
         now = time.time()
+        await self._reconcile_wallet(now, marks)
         if now - self._last_calib > 5:
             self._last_calib = now
             for m in self.markets.active.values():

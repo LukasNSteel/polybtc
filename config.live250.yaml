@@ -198,6 +198,28 @@ sniper:
   max_t_rem_sec_hourly: 900    # 1h: last 15 min
   max_t_rem_sec_4h: 300        # 4h: last 5 min
   min_t_rem_sec: 0             # 0 = trade down to settlement (see $1k config).
+  # SETTLEMENT-SAFETY CUTOFF (added June 23 after live session 1782200216).
+  # Refuse to snipe inside the final N seconds before close. This is a SAFETY
+  # guard, distinct from the edge gate above: in the last few seconds the book
+  # gaps as the outcome resolves, so a marketable FAK sized off the book we saw
+  # lands ~100ms+ later on the COLLAPSING side and fills well below the quoted
+  # ask — i.e. on the underdog the min_ask favourite gate is meant to exclude.
+  # That is exactly how two live snipes that passed the favourite gate (quotes
+  # 0.50 / 0.73) still filled as underdogs (0.35 / 0.19) 1-3s before close and
+  # lost. The favourite-only rule only holds if we never take into this gap.
+  # Mirrors the scalper's min_tau_sec resolution buffer. Per-kind overrides the
+  # global; 0/unset = no buffer (legacy). Composes with min_t_rem_sec (the
+  # effective floor is the larger of the two).
+  close_buffer_sec: 20         # global fallback
+  close_buffer_sec_5m: 20
+  close_buffer_sec_15m: 25
+  close_buffer_sec_hourly: 45
+  close_buffer_sec_4h: 60
+  max_book_age_sec: 3          # never snipe off a WS order book older than this
+                               # (was an implicit 15s). The favourite gate reads
+                               # the displayed ask, so it is only meaningful on a
+                               # CURRENT book — a stale snapshot is how a
+                               # pre-collapse ask passes the gate.
   max_inventory_frac: 0.25     # skip a side once net same-side inventory exceeds
                                # this fraction of max_position_usd: stacking one
                                # side on the same lagging signal built every
@@ -317,10 +339,16 @@ presign:
   # OFF by default: turning it on means a fast-path snipe snaps its stake
   # DOWN to the nearest pre-signed bucket. Tune the buckets to your real
   # snipe/scalp stake range (sniper.max_take_usd, scalper.max_usd).
-  enabled: false
+  enabled: true              # ON (2026-06-23): shadow log showed ~1.5s submit->ack
+                             # vs ~1ms network RTT — the cost is client-side order
+                             # BUILD (create_market_order), not the wire. Pre-signing
+                             # moves that build off the hot path so a snipe is just
+                             # the POST. The TAKER TIMING probe + analyze_shadow
+                             # (build vs post, by presigned) measure the win directly.
   refresh_sec: 2.0           # rebuild/refresh the ladder this often
   price_radius_ticks: 1      # pre-sign +/- this many ticks around the live best ask
-  amount_buckets_usd: [5, 10, 15, 25]  # collateral stake buckets to pre-sign ($250 tier)
+  amount_buckets_usd: [5, 10, 15, 20, 25]  # added 20 to match sniper.max_take_usd
+                             # (was [5,10,15,25]); reduces fast-path stake snap-down
   amount_tol: 0.7            # fast path only if a bucket is >= this fraction of desired stake
   max_age_sec: 45            # drop pre-signed orders older than this (kept fresh vs the book)
 
@@ -394,10 +422,33 @@ live:
   # real pUSD collateral at startup instead of paper.starting_cash. Set false to
   # fall back to the configured starting_cash.
   seed_from_wallet: true
+  # LIVE SETTLEMENT reads the REAL Polymarket resolution (Chainlink/UMA via the
+  # CLOB winner flag / Gamma outcomePrices), NOT the Binance kline. The Binance
+  # proxy disagrees with the real source on coin-flip closes (basis risk) and
+  # booking the wrong winner makes live P&L fiction (observed 2026-06-23: a 0.50
+  # DOWN snipe the bot scored a $21.64 win actually resolved UP / lost). Paper
+  # mode still settles on Binance (the simulator's own truth).
+  resolve_poll_sec: 10       # poll each unresolved expired market this often
+                             # (oracle resolution lags the close by seconds)
+  # Reconcile the bot's internal cash against the real wallet pUSD collateral
+  # every reconcile_sec; log at WARNING if they diverge by more than
+  # reconcile_warn_usd (a growing gap = books drifting from reality).
+  reconcile_sec: 30
+  reconcile_warn_usd: 10.0
   # public Polygon RPC for on-chain merge/redeem. polygon-rpc.com now returns
   # 401, so default to publicnode; swap in a private RPC (Alchemy/Infura) for
   # production reliability from your Dublin box.
   polygon_rpc: https://polygon-bor-rpc.publicnode.com
+
+shadow:
+  # Shadow latency / fill-capture logger (live only). Records, per live taker
+  # FAK: the book we saw at submit, submit->ack latency, fill capture vs the
+  # displayed size, slippage, and post-fill mid markouts -> logs/shadow_taker.jsonl.
+  # This is the ground truth (ROADMAP P0.2) that should replace the paper sim's
+  # ASSUMED taker_latency_ms / speed_bump_ms / capture / race_loss_prob. Pure
+  # observation: no effect on trading. Analyse with research/analyze_shadow.py.
+  enabled: true
+  markout_horizons_sec: [2, 10]
 
 log_dir: logs
 state_file: state.json   # positions/cash survive restarts (run with --fresh to ignore)

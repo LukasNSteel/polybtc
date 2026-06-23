@@ -103,6 +103,15 @@ async def amain(args: argparse.Namespace) -> None:
             log.warning("signature_type=%s: positions live in a proxy wallet; "
                         "on-chain merge/redeem disabled (use the Polymarket UI). "
                         "Use signature_type=0 (EOA) for automatic merging.", sig_type)
+        shadow = None
+        if cfg.get("shadow", "enabled", default=True):
+            from .shadow import ShadowTakerLogger
+            shadow = ShadowTakerLogger(
+                feed,
+                log_dir=cfg.get("log_dir", default="logs"),
+                markout_horizons_sec=tuple(
+                    cfg.get("shadow", "markout_horizons_sec", default=[2, 10])),
+            )
         executor = LiveExecutor(
             portfolio,
             host=cfg.get("live", "host", default="https://clob.polymarket.com"),
@@ -121,6 +130,7 @@ async def amain(args: argparse.Namespace) -> None:
                 cfg.get("presign", "amount_buckets_usd", default=[25, 50, 75, 100])),
             presign_amount_tol=cfg.get("presign", "amount_tol", default=0.7),
             presign_max_age_sec=cfg.get("presign", "max_age_sec", default=45.0),
+            shadow=shadow,
         )
         # Seed the equity baseline from REAL wallet collateral, not a config
         # guess — so the kill switch and equity-scaling reference track funded
