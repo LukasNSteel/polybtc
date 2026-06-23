@@ -718,6 +718,12 @@ class LiveExecutor:
         # token -> {(price, amount): (signed_order, signed_at)}
         self._presigned: dict[str, dict[tuple[float, float], tuple]] = {}
         self._warmed_tokens: set[str] = set()
+        # monotonic ts of the last successful CLOB keep-warm ping (run_keepwarm).
+        # py_clob_client_v2 posts orders over a module-level httpx client whose
+        # keep-alive idles out after ~5s; our FAKs fire minutes apart, so this
+        # tells the shadow log whether a slow POST rode a cold (reconnecting)
+        # socket vs genuine server-side matching time.
+        self._last_warm = 0.0
         self._merge_queue: dict[str, Market] = {}   # condition_id -> market
         self._redeem_queue: dict[str, Market] = {}
         self._tracked_conditions: set[str] = set()
@@ -757,6 +763,27 @@ class LiveExecutor:
             return int(ba.get("balance", 0)) / 1e6
         except (TypeError, ValueError):
             return 0.0
+
+    async def run_keepwarm(self, interval_sec: float = 3.0) -> None:
+        """Keep the shared CLOB HTTP/2 connection warm so a taker FAK is just a
+        warm POST, not a fresh TLS+connection setup.
+
+        py_clob_client_v2 sends every order over a module-level httpx.Client
+        whose keep-alive idles out after ~5s (httpx default). Our taker FAKs
+        fire minutes apart and nothing else touches that client between them
+        (market refresh uses a separate aiohttp session; reconcile only runs
+        every 30s), so most snipes pay a cold reconnect on the critical path
+        and inflate the submit->ack tail. A cheap GET /time on the shared
+        client every few seconds keeps the socket open. Read-only; never
+        trades, and a failed ping never stops the bot."""
+        interval = max(1.0, float(interval_sec))
+        while True:
+            try:
+                await asyncio.to_thread(self.client.get_server_time)
+                self._last_warm = time.monotonic()
+            except Exception as e:  # noqa: BLE001 — keep-warm must never break trading
+                log.debug("keep-warm ping failed: %s", e)
+            await asyncio.sleep(interval)
 
     def track_markets(self, condition_ids: set[str]) -> None:
         """Keep the user websocket subscribed to all markets we trade."""
@@ -866,6 +893,12 @@ class LiveExecutor:
         # submit latency against a ~1ms network RTT, so we need to know which
         # of the two owns it. presigned=true rows isolate the POST-only cost.
         t_build0 = time.monotonic()
+        if shadow_attempt is not None:
+            # how long since the CLOB connection was last kept warm (run_keepwarm).
+            # Lets analyze_shadow separate a slow POST caused by a cold reconnect
+            # from genuine server-side matching latency. None = keep-warm not running.
+            shadow_attempt["warm_age_ms"] = (round((t_build0 - self._last_warm) * 1000, 1)
+                                             if self._last_warm else None)
         t_build1 = None
         try:
             if presigned is not None:

@@ -147,6 +147,9 @@ async def amain(args: argparse.Namespace) -> None:
                             "starting_cash $%.2f", portfolio.start_cash)
         tasks.append(executor.run_user_feed())
         tasks.append(executor.process_onchain())
+        # keep the CLOB HTTP/2 connection warm (httpx idles it out at ~5s) so a
+        # sparse taker FAK rides a warm POST instead of a cold reconnect
+        tasks.append(executor.run_keepwarm())
         # pre-warm market-info caches (and, if enabled, keep the pre-signed
         # FAK ladder warm) for every market we currently trade
         tasks.append(executor.run_presigner(feed, lambda: list(markets.active.values())))

@@ -107,6 +107,18 @@ def main():
             print(f"  {label}: n={len(group)} | "
                   f"build {fmt_stats(b, 'ms') if b else 'n=0'} | "
                   f"post {fmt_stats(p, 'ms') if p else 'n=0'}")
+        # Cold-socket check: warm_age_ms is how long since the keep-warm ping
+        # touched the shared CLOB connection. httpx idles a keep-alive out at
+        # ~5s, so attempts with warm_age > 5000ms rode a cold reconnect. If
+        # those POSTs are materially slower than the warm ones, the keep-warm
+        # task is the lever; if not, the ~600ms POST is pure server-side time.
+        warm = [a for a in attempts
+                if a.get("warm_age_ms") is not None and a.get("post_ms") is not None]
+        if warm:
+            cold = [a["post_ms"] for a in warm if a["warm_age_ms"] > 5000]
+            hot = [a["post_ms"] for a in warm if a["warm_age_ms"] <= 5000]
+            print(f"  post by socket: warm(<=5s) {fmt_stats(hot, 'ms') if hot else 'n=0'}"
+                  f" | cold(>5s) {fmt_stats(cold, 'ms') if cold else 'n=0'}")
         print()
 
     age = [a["book_age_ms"] for a in attempts if a.get("book_age_ms") is not None]
