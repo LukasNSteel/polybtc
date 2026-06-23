@@ -206,12 +206,18 @@ are charged the dynamic fee in the bot's accounting.
   and earn ~20% of collected fees as daily rebates. The bot parses each
   market's `feeSchedule`, charges taker fees in the paper simulator, and the
   sniper/scalper only act when the edge clears the fee.
-  **Open question:** a third-party bot's live fills matched the *old*
-  `0.07 × min(p, 1−p)` formula (≈2× higher at mid prices) despite the docs.
-  The live executor logs a `FEE CHECK` line on every taker fill comparing
-  the exchange-reported fee to both formulas — check it on your first live
-  fill, and if min() is real, fix `Market.taker_fee_per_share`. The strategy
-  stays +EV under either formula (stress-tested in `test_dual_beta.py`).
+  **Resolved (2026-06-22, live `--fire` smoke test):** a real ~$2.90 taker
+  fill (5.18 sh @ 0.56 on an hourly BTC market) was charged a ground-truth fee
+  of **$0.0893 = 0.0172/share**, measured as the actual collateral balance
+  delta minus fill cost. That matches `0.07 × p(1−p)` exactly (predicted
+  0.0172/sh) and **refutes** the third-party `0.07 × min(p, 1−p)` claim (would
+  be 0.0308/sh, ≈1.8× higher) and the quadratic `(p(1−p))²` variant (the live
+  `feeSchedule` reports `exponent: 1`). The bot's model and
+  `fees.assume_taker_rate: null` (trust the advertised schedule) are correct;
+  no change to `Market.taker_fee_per_share` needed. The live executor still
+  logs a `FEE CHECK` line on every taker fill so any future schedule change is
+  caught. The strategy stays +EV under either formula regardless
+  (stress-tested in `test_dual_beta.py`).
 - **Speed bump removed** (Feb 18, 2026): the old taker order delay on crypto
   markets is gone (`seconds_delay: 0` on the CLOB). This cuts both ways — our
   takes land instantly, but our resting maker quotes can be picked off

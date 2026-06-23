@@ -14,6 +14,10 @@ import websockets
 
 log = logging.getLogger("coinbase")
 
+# Only escalate to WARNING after this many consecutive reconnect failures; a
+# single idle-close that recovers on the next attempt stays at DEBUG.
+WS_WARN_AFTER = 3
+
 WS_URL = "wss://ws-feed.exchange.coinbase.com"
 
 
@@ -33,11 +37,18 @@ class CoinbaseFeed:
     async def run(self) -> None:
         sub = {"type": "subscribe", "product_ids": [self.symbol], "channels": ["ticker"]}
         backoff = 2.0
+        connected_once = False
+        fails = 0
         while True:
             try:
                 async with websockets.connect(WS_URL, ping_interval=20) as ws:
                     await ws.send(json.dumps(sub))
-                    log.info("connected to coinbase %s ticker", self.symbol)
+                    if fails >= WS_WARN_AFTER:
+                        log.info("coinbase %s reconnected", self.symbol)
+                    elif not connected_once:
+                        log.info("connected to coinbase %s ticker", self.symbol)
+                    connected_once = True
+                    fails = 0
                     backoff = 2.0
                     async for msg in ws:
                         d = json.loads(msg)
@@ -51,7 +62,12 @@ class CoinbaseFeed:
                         self.mid_ts = now
                         self.last_local_ts = now
             except Exception as e:
-                log.warning("coinbase ws error: %s; retrying in %.0fs "
-                            "(binance spot still drives trading)", e, backoff)
+                fails += 1
+                if fails >= WS_WARN_AFTER:
+                    log.warning("coinbase ws error: %s; retrying in %.0fs "
+                                "(%d consecutive; binance spot still drives trading)",
+                                e, backoff, fails)
+                else:
+                    log.debug("coinbase ws error: %s; retrying in %.0fs", e, backoff)
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 60)

@@ -324,6 +324,22 @@ class Strategy:
                "4h": "cutoff_sec_4h"}.get(m.kind, "cutoff_sec_hourly")
         return self.cfg.get("trading", key, default=0)
 
+    def _max_t_rem_sec(self, m: Market) -> float:
+        """Per-kind late-window gate: only snipe inside the final N seconds of a
+        window, where N depends on the market kind. A kind-specific key
+        (max_t_rem_sec_{5m,15m,hourly,4h}) overrides the global sniper.max_t_rem_sec
+        when set; 0/unset = full window. Per-kind windows are fitted on real
+        15m/1h/4h data in research/test_longmkts_windows.py — the parquet replay
+        archive is 5m-only, so the legacy global gate was a 5m result applied
+        blindly to every kind (a 4h snipe could fire ~4h before resolution, where
+        the EV is break-even-to-negative under realistic spreads)."""
+        key = {"5m": "max_t_rem_sec_5m", "15m": "max_t_rem_sec_15m",
+               "4h": "max_t_rem_sec_4h"}.get(m.kind, "max_t_rem_sec_hourly")
+        per_kind = self.cfg.get("sniper", key, default=None)
+        if per_kind is not None:
+            return per_kind
+        return self.cfg.get("sniper", "max_t_rem_sec", default=0) or 0
+
     def _tradable(self, m: Market) -> bool:
         """Polymarket halts some markets before expiry; also apply our own cutoff."""
         return m.accepting and m.t_remaining > self._cutoff_sec(m)
@@ -488,6 +504,20 @@ class Strategy:
         c = self.cfg["sniper"]
         if (not c["enabled"] or not self._tradable(m) or not self._vol_warm()
                 or self._fak_tier >= 3):
+            return
+        # late-window gate (optional): only snipe inside [min_t_rem_sec,
+        # max_t_rem_sec] before resolution. Backtest over ~8wk
+        # (research/test_late_window.py): at the $1k/$250 bankrolls the early
+        # window's fills carry a peak-to-trough drawdown LARGER than the deployed
+        # capital (103% at $1k, 294% at $250), while the final ~60s concentrate
+        # the win rate (64%->70%+) and the best ROI/$ at a fraction of that
+        # drawdown. $1000 tier -> last 60s, $250 tier -> last 30s. Unset/0 ==
+        # trade the full window (legacy behavior).
+        max_t_rem = self._max_t_rem_sec(m)
+        if max_t_rem and m.t_remaining > max_t_rem:
+            return
+        min_t_rem = c.get("min_t_rem_sec")
+        if min_t_rem and m.t_remaining < min_t_rem:
             return
         per_mkt_cap = caps["max_position_usd"]
         min_edge = c["min_edge"] + self._fak_adjustments.get("min_edge_bump", 0.0)

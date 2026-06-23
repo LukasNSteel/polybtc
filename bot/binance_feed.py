@@ -41,6 +41,10 @@ import websockets
 
 log = logging.getLogger("binance")
 
+# Only escalate to WARNING after this many consecutive reconnect failures; a
+# routine idle-close that recovers on the next attempt stays at DEBUG.
+WS_WARN_AFTER = 3
+
 # binance.vision hosts are Binance's public market-data mirror (no geo-block)
 WS_URL = "wss://data-stream.binance.vision/stream?streams={streams}"
 REST_KLINES = "https://data-api.binance.vision/api/v3/klines"
@@ -268,10 +272,17 @@ class BinanceFeed:
     async def run(self) -> None:
         streams = f"{self.symbol}@trade/{self.symbol}@bookTicker"
         url = WS_URL.format(streams=streams)
+        connected_once = False
+        fails = 0
         while True:
             try:
                 async with websockets.connect(url, ping_interval=20) as ws:
-                    log.info("connected to binance %s", streams)
+                    if fails >= WS_WARN_AFTER:
+                        log.info("binance %s reconnected", streams)
+                    elif not connected_once:
+                        log.info("connected to binance %s", streams)
+                    connected_once = True
+                    fails = 0
                     async for msg in ws:
                         d = json.loads(msg)
                         data = d.get("data", {})
@@ -289,7 +300,11 @@ class BinanceFeed:
                                 self.mid_ts = time.time()
                                 self._update_cb_basis(self.mid_ts)
             except Exception as e:
-                log.warning("binance ws error: %s; reconnecting in 2s", e)
+                fails += 1
+                if fails >= WS_WARN_AFTER:
+                    log.warning("binance ws error: %s; reconnecting in 2s (%d consecutive)", e, fails)
+                else:
+                    log.debug("binance ws error: %s; reconnecting in 2s", e)
                 await asyncio.sleep(2)
 
     async def run_fstream(self) -> None:
@@ -309,10 +324,17 @@ class BinanceFeed:
             streams.append(f"{self.symbol}@forceOrder")
         url = FSTREAM_WS_URL.format(streams="/".join(streams))
         backoff = 2.0
+        connected_once = False
+        fails = 0
         while True:
             try:
                 async with websockets.connect(url, ping_interval=20) as ws:
-                    log.info("connected to binance fstream %s", "/".join(streams))
+                    if fails >= WS_WARN_AFTER:
+                        log.info("binance fstream %s reconnected", "/".join(streams))
+                    elif not connected_once:
+                        log.info("connected to binance fstream %s", "/".join(streams))
+                    connected_once = True
+                    fails = 0
                     backoff = 2.0
                     async for msg in ws:
                         payload = json.loads(msg).get("data", {})
@@ -328,8 +350,13 @@ class BinanceFeed:
                         self.perp_ts = now
                         self._update_perp_basis(now)
             except Exception as e:
-                log.warning("binance fstream ws error: %s; retrying in %.0fs "
-                            "(spot feed still drives trading)", e, backoff)
+                fails += 1
+                if fails >= WS_WARN_AFTER:
+                    log.warning("binance fstream ws error: %s; retrying in %.0fs "
+                                "(%d consecutive; spot feed still drives trading)",
+                                e, backoff, fails)
+                else:
+                    log.debug("binance fstream ws error: %s; retrying in %.0fs", e, backoff)
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 60)
 

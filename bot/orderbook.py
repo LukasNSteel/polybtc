@@ -11,6 +11,11 @@ import websockets
 
 log = logging.getLogger("orderbook")
 
+# Routine websocket drops auto-recover in 2s; only escalate to a WARNING once
+# this many reconnects fail in a row (i.e. the feed is actually down, not just
+# cycling on an idle close), to keep long sessions from spamming the log.
+WS_WARN_AFTER = 3
+
 WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 
 
@@ -83,6 +88,8 @@ class OrderBookFeed:
             await ws.send("PING")
 
     async def run(self) -> None:
+        connected_once = False
+        fails = 0
         while True:
             if not self._assets:
                 await asyncio.sleep(1)
@@ -92,7 +99,14 @@ class OrderBookFeed:
             try:
                 async with websockets.connect(WS_URL, ping_interval=None) as ws:
                     await ws.send(json.dumps({"type": "market", "assets_ids": assets}))
-                    log.info("subscribed to %d assets", len(assets))
+                    if fails >= WS_WARN_AFTER:
+                        log.info("clob ws reconnected, subscribed to %d assets", len(assets))
+                    elif not connected_once:
+                        log.info("subscribed to %d assets", len(assets))
+                    else:
+                        log.debug("clob ws resubscribed to %d assets", len(assets))
+                    connected_once = True
+                    fails = 0
                     ping_task = asyncio.create_task(self._pinger(ws))
                     try:
                         while not self._want_reconnect.is_set():
@@ -108,5 +122,9 @@ class OrderBookFeed:
                     finally:
                         ping_task.cancel()
             except Exception as e:
-                log.warning("clob ws error: %s; reconnecting in 2s", e)
+                fails += 1
+                if fails >= WS_WARN_AFTER:
+                    log.warning("clob ws error: %s; reconnecting in 2s (%d consecutive)", e, fails)
+                else:
+                    log.debug("clob ws error: %s; reconnecting in 2s", e)
                 await asyncio.sleep(2)

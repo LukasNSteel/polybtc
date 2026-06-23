@@ -19,6 +19,13 @@ log = logging.getLogger("exec")
 
 MIN_SHARES = 5.0  # Polymarket minimum order size
 
+# Per-write sequence so concurrent state saves never share a temp filename.
+_save_counter = itertools.count()
+
+# Only escalate a reconnect to WARNING after this many consecutive failures; a
+# routine idle-close that recovers on the next attempt stays at DEBUG.
+WS_WARN_AFTER = 3
+
 
 class FakStats:
     """Track fill-and-kill outcomes with a rolling window for race-loss monitoring."""
@@ -328,10 +335,26 @@ class Portfolio:
             "leg_realized": self.leg_realized,
             "meta": self.meta,
         }
-        tmp = self.state_file + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(state, f, indent=1)
-        os.replace(tmp, self.state_file)
+        # A fixed "state.json.tmp" is a shared path: if two writers (e.g. the
+        # strategy task and the live user-ws fill handler, or a second bot
+        # instance in the same dir) write it concurrently, the first os.replace
+        # consumes the temp and the second finds it gone -> FileNotFoundError,
+        # which previously bubbled up and failed the whole strategy step. A
+        # pid+seq temp name keeps each write private, and a failed save now
+        # degrades to a warning instead of crashing the loop.
+        tmp = f"{self.state_file}.{os.getpid()}.{next(_save_counter)}.tmp"
+        try:
+            with open(tmp, "w") as f:
+                json.dump(state, f, indent=1)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self.state_file)
+        except OSError as e:
+            log.warning("state save failed (%s); continuing", e)
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
 
     def restore(self) -> list[Market]:
         """Load saved state. Returns Market stubs for restored positions whose
@@ -1052,6 +1075,8 @@ class LiveExecutor:
         creds = self.client.creds
         auth = {"apiKey": creds.api_key, "secret": creds.api_secret,
                 "passphrase": creds.api_passphrase}
+        connected_once = False
+        fails = 0
         while True:
             if not self._tracked_conditions:
                 await asyncio.sleep(1)
@@ -1061,7 +1086,14 @@ class LiveExecutor:
             try:
                 async with websockets.connect(USER_WS_URL, ping_interval=None) as ws:
                     await ws.send(json.dumps({"type": "user", "markets": markets, "auth": auth}))
-                    log.info("user feed subscribed to %d markets", len(markets))
+                    if fails >= WS_WARN_AFTER:
+                        log.info("user feed reconnected, subscribed to %d markets", len(markets))
+                    elif not connected_once:
+                        log.info("user feed subscribed to %d markets", len(markets))
+                    else:
+                        log.debug("user feed resubscribed to %d markets", len(markets))
+                    connected_once = True
+                    fails = 0
 
                     async def pinger():
                         while True:
@@ -1083,5 +1115,9 @@ class LiveExecutor:
                     finally:
                         ping_task.cancel()
             except Exception as e:
-                log.warning("user ws error: %s; reconnecting in 2s", e)
+                fails += 1
+                if fails >= WS_WARN_AFTER:
+                    log.warning("user ws error: %s; reconnecting in 2s (%d consecutive)", e, fails)
+                else:
+                    log.debug("user ws error: %s; reconnecting in 2s", e)
                 await asyncio.sleep(2)

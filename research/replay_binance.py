@@ -142,6 +142,22 @@ def fee_ps(a):
     return FEE * a * (1 - a)
 
 
+# Canonical BTC up/down window lengths (seconds) -> kind label. Each market's
+# kind is recovered from its actual duration (end_ep - start_ep) snapped to the
+# nearest of these, so the replay can gate / attribute PnL per market kind.
+KIND_DUR = {"5m": 300, "15m": 900, "1h": 3600, "4h": 14400}
+
+
+def classify_kind(dur):
+    """Vectorized: snap each window duration (s) to the nearest canonical kind."""
+    dur = np.asarray(dur, dtype=float)
+    labels = np.array(list(KIND_DUR.keys()))
+    durs = np.array(list(KIND_DUR.values()), dtype=float)
+    # nearest in log space so 300 vs 900 vs 3600 vs 14400 separate cleanly
+    idx = np.argmin(np.abs(np.log(dur[:, None]) - np.log(durs[None, :])), axis=1)
+    return labels[idx]
+
+
 # ---------------------------------------------------------------- main
 def run(cfg, base, price, vol, ticks, obi=None):
     s = ticks["t"]
@@ -154,6 +170,7 @@ def run(cfg, base, price, vol, ticks, obi=None):
     ob = obi[ix] if obi is not None else np.zeros(len(ix))
     openp = price[np.clip(d["start_ep"] - base, 0, len(price) - 1)]
     t_rem = (d["end_ep"] - s).astype(float)
+    kind = classify_kind(d["end_ep"] - d["start_ep"])
     rr = np.log(spot / price[np.clip(ix - 60, 0, len(price) - 1)])
 
     mom_beta = 0.5
@@ -196,6 +213,20 @@ def run(cfg, base, price, vol, ticks, obi=None):
     if cfg.get("min_t_rem"):
         cand_up &= t_rem >= cfg["min_t_rem"]
         cand_dn &= t_rem >= cfg["min_t_rem"]
+    # PER-KIND late-window gate (optional): {kind: max_t_rem_sec}. A kind listed
+    # here may only fire inside its last max_t_rem_sec; kinds NOT listed keep the
+    # full window. This is exactly the "betting window for 15m/1h/4h, leave 5m
+    # full" rule under test. kind_min_t_rem mirrors it on the lower bound.
+    for key, cmp in (("kind_max_t_rem", "le"), ("kind_min_t_rem", "ge")):
+        gate = cfg.get(key)
+        if not gate:
+            continue
+        for k, lim in gate.items():
+            km = kind == k
+            ok = (t_rem <= lim) if cmp == "le" else (t_rem >= lim)
+            keep = ~km | ok  # outside this kind -> untouched; inside -> must pass
+            cand_up &= keep
+            cand_dn &= keep
     cand = cand_up | cand_dn
     ci = np.where(cand)[0]
 
@@ -282,7 +313,9 @@ def run(cfg, base, price, vol, ticks, obi=None):
             heapq.heappush(pend, (end_ep[i], pnl, cost))
             exposure += cost
             mkt_cost[cond[i]] += cost
-            fills.append((cost, f, pnl, won, ask, side, int(end_ep[i]), float(ob[i])))
+            # tuple fields 0..7 unchanged for back-compat; 8=kind, 9=t_rem(s)
+            fills.append((cost, f, pnl, won, ask, side, int(end_ep[i]), float(ob[i]),
+                          str(kind[i]), float(t_rem[i])))
     while pend:
         _, pnl, cost = heapq.heappop(pend)
         realized += pnl

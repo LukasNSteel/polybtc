@@ -30,6 +30,8 @@ fees:
   # 0.07  -> hardcode the crypto rate regardless of what the schedule reports.
   # Physically re-verify with `python -m bot.live_trade_smoke --fire` (FEE CHECK
   # now measures the real collateral balance delta around the fill).
+  # VERIFIED 2026-06-22 via --fire: real fill 5.18 sh @ 0.56 charged 0.0172/sh,
+  # an exact match to 0.07*p(1-p); the min(p,1-p) variant (0.0308/sh) is refuted.
   assume_taker_rate: null
 
 perp_lead:
@@ -178,6 +180,24 @@ sniper:
                                # (was 100 at the $1k tier)
   max_position_usd: 40         # per-market snipe cost cap (~16% of bankroll;
                                # was 150 at the $1k tier)
+  # PER-KIND late-window gate (supersedes the old single 30s gate). The windows
+  # are the EDGE-LOCATION result from research/test_longmkts_windows.py on real
+  # 15m/1h/4h data (the parquet archive is 5m-only):
+  #   5m : FULL window   15m: FULL window   1h: last 900s   4h: last 300s
+  #   (15m early band is +28-30%/$1 & spread-robust, so it stays full like 5m)
+  # CAVEAT FOR THE $250 TIER: these ceilings were fitted at the $1000-optimised
+  # caps and are LOOSER than the old 30s gate, so they trade more of each window
+  # and carry MORE drawdown. The 30s gate existed because at $250 the wider 5m
+  # full-window drawdown was ~294% of capital (kill-switch death). If you run
+  # this tier live and see drawdown stress, tighten these (e.g. 5m->30/60,
+  # 15m->120, 1h->300, 4h->180) — the edge per $ only improves as you gate later.
+  # A kind key overrides the global max_t_rem_sec; 0/unset = full window.
+  max_t_rem_sec: 0             # global fallback (0 = full window)
+  max_t_rem_sec_5m: 0          # 5m: full window
+  max_t_rem_sec_15m: 0         # 15m: full window
+  max_t_rem_sec_hourly: 900    # 1h: last 15 min
+  max_t_rem_sec_4h: 300        # 4h: last 5 min
+  min_t_rem_sec: 0             # 0 = trade down to settlement (see $1k config).
   max_inventory_frac: 0.25     # skip a side once net same-side inventory exceeds
                                # this fraction of max_position_usd: stacking one
                                # side on the same lagging signal built every

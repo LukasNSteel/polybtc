@@ -1,4 +1,29 @@
-# polybtc bot configuration
+# polybtc bot configuration — $1000 LIVE tier (OPTIMISED, full-window)
+#
+# Same strategy as config.yaml / config.live250.yaml, with risk/sizing tuned for
+# a ~$1000 bankroll. Run with:  python -m bot.main --config config.live1000optimised.yaml --live
+#
+# WHY THIS CONFIG EXISTS (research/test_caps_1000.py + research/test_seed_robust.py,
+# 8-week Binance replay, 12 random fill-race seeds):
+#   The $250 tier had to use a LATE-WINDOW gate (last 30s only) because at a tiny
+#   bankroll the full-window sniper's 2-month drawdown is ~3x the capital — it
+#   would trip the kill switch / go broke before realizing the edge.
+#   With $1000 behind it, the better lever is NOT the time gate but right-sized
+#   caps + the FULL window. Gating $250-caps to the last 60s cut PnL from +$1,963
+#   to +$505; the full window with survivable caps keeps it.
+#   Seed sweep (full window, $1000, no kill switch modeled):
+#       exp80  (take13/pos26): +$1,401 med, worst DD 62% of cap, survives all 12
+#       exp100 (take16/pos32): +$1,514 med, worst DD 84% of cap, survives all 12 <-- USE THIS
+#       exp125 (take20/pos40): +$2,042 med, worst DD 104%, BREACHES on 2/12 seeds
+#   exp100 is the LARGEST sizing whose worst-case unmanaged 2-month drawdown stays
+#   under the $1000 bankroll on every seed. The live kill switch + equity scaling
+#   below are additional backstops the backtest does not model, so live drawdown
+#   is gentler still. NO sniper time gate here — full window is the point of $1000.
+#
+# Capital baseline is NOT hardcoded: in --live mode the bot reads the wallet's
+# real pUSD collateral at startup and uses it as the equity baseline for the
+# kill switch and equity-scaling (see live.seed_from_wallet below). The dollar
+# caps here are sized for the ~$1000 tier.
 
 asset: BTC
 binance_symbol: BTCUSDT
@@ -150,12 +175,11 @@ sniper:
   enabled: true
   min_edge: 0.10               # gate on the dual-beta ROBUST edge (worst-case
                                # P across both regimes)
-  max_edge: 0.20               # winner's-curse veto, TIGHTENED 0.25->0.20: with
-                               # edge_contention+feed_lag modeled, the Binance
-                               # replay shows 0.20 keeps ~all the PnL of 0.25 but
-                               # cuts max drawdown ~1/3 (pnl/DD 3.0 vs 2.0). A
-                               # giant edge still on the book is one the fast bots
-                               # passed on; live edge>=0.15 fills went 0-for-5.
+  max_edge: 0.20               # winner's-curse veto, TIGHTENED 0.25->0.20 (Binance
+                               # replay w/ contention+feed_lag: same PnL, ~1/3 less
+                               # drawdown). A giant edge still on the book 350ms
+                               # after the move is one the fast bots passed on;
+                               # live edge>=0.15 fills went 0-for-5 (-104%/$1).
   robust_betas: [0.83, 1.36]   # lead-stickiness regimes fitted per-day on 1,847
                                # markets: ~0.8-0.9 mean-reversion days, ~1.2-1.4
                                # momentum days. Entry must be +EV under BOTH.
@@ -166,28 +190,35 @@ sniper:
   max_ask: 0.80                # above this the snipe edge was fee-dead live
                                # (-21.6%); near-certainty buys belong to the
                                # scalper and its 0.997 probability gate
-  max_take_usd: 30             # cut from 100: the cross-method study (paper-log
-                               # resize, 8-week parquet liquidity, Binance replay)
-                               # showed big takes are adversely selected and
-                               # unfillable late; ~$30 ~ median late ask liquidity
-  max_position_usd: 60         # cut from 150: ~2 takes/market; caps the loss tail
-  # PER-KIND late-window gate (supersedes the old single 60s gate, which was a
-  # 5m-only result — the parquet replay archive has no 15m/1h/4h markets). Fitted
-  # on real long-market data in research/test_longmkts_windows.py:
-  #   5m : FULL window  - every t_rem band +EV; gating only sheds PnL.
-  #   15m: FULL window  - like 5m: early band (600-900s) is +28-30%/$1 & spread-
-  #                        robust; gating just sheds ~28% gross PnL for a small DD cut.
-  #   1h : last 900s    - (900,1800]s band weak (+9%/$1) & not spread-robust.
-  #   4h : last 300s    - early/mid window NEGATIVE under spread; edge in last ~5min.
+  max_take_usd: 16             # $1000 tier OPTIMISED: largest per-take whose
+                               # full-window 2-month drawdown stays under the
+                               # bankroll on all 12 replay seeds (worst 84%).
+                               # take20 (exp125) breached $1000 on 2/12 seeds.
+  max_position_usd: 32         # per-market snipe cost cap (2x take; ~3.2% of
+                               # the $1000 bankroll per market window)
+  # PER-KIND late-window gate. The old "full window is the point" rationale was
+  # a 5m result applied blindly to every kind — the parquet replay archive is
+  # 5m-ONLY, so 15m/1h/4h were never actually backtested. The long-market study
+  # (research/test_longmkts_windows.py, real CLOB+Binance data May-Jun 2026:
+  # 3,263 15m / 812 1h / 204 4h resolved markets) shows the snipe edge sits in a
+  # DIFFERENT fraction of each window, so the gate is now per-kind:
+  #   5m : FULL window  - every t_rem band is +EV; gating only sheds PnL (the 5m
+  #                        parquet replay agrees: full window is the most +EV).
+  #   15m: FULL window  - like 5m: +EV across the WHOLE window. The earliest band
+  #                        (t_rem 600-900s) is +28-30%/$1 and spread-robust, so a
+  #                        gate just sheds ~28% of gross PnL for a modest DD cut.
+  #   1h : last 900s    - the (900,1800]s band is weak (+9%/$1) and NOT
+  #                        spread-robust; edge concentrates in the final ~15min.
+  #   4h : last 300s    - early/mid window is NEGATIVE under realistic spreads
+  #                        (full-window 4h -> -7%/$1 at a 3c spread); essentially
+  #                        ALL of the edge is in the final ~5min.
   # A kind key overrides the global max_t_rem_sec; 0/unset = full window.
   max_t_rem_sec: 0             # global fallback (0 = full window)
   max_t_rem_sec_5m: 0          # 5m: full window
-  max_t_rem_sec_15m: 0         # 15m: full window
+  max_t_rem_sec_15m: 0         # 15m: full window (early band is +EV & spread-robust)
   max_t_rem_sec_hourly: 900    # 1h: last 15 min
   max_t_rem_sec_4h: 300        # 4h: last 5 min
-  min_t_rem_sec: 0             # 0 = trade down to settlement. Don't push above
-                               # ~10s: the final-seconds edge is real live but
-                               # model-unstable in backtest (vol*sqrt(t)->0).
+  min_t_rem_sec: 0             # 0 = trade down to settlement
   max_inventory_frac: 0.25     # skip a side once net same-side inventory exceeds
                                # this fraction of max_position_usd: stacking one
                                # side on the same lagging signal built every
@@ -219,7 +250,10 @@ scalper:
                                # argument (it can also see the resolution source)
   max_price: 0.99              # was 0.999: above 0.99 the fee eats the entire
                                # edge (+0.3-0.6%/$1 at best, n.s.)
-  max_usd: 100                 # max USDC per scalp
+  max_usd: 30                  # $1000 tier: max USDC per scalp. Modest vs the
+                               # sniper because the scalp shares the same total
+                               # exposure pool (risk.max_total_exposure_usd) and
+                               # the replay sizing study only covers the sniper.
   limit_slack_ticks: 2         # FAK limit tolerance (ticks); capped at max_price
                                # so a probe never pays past the tested band
 
@@ -257,12 +291,19 @@ guards:
   markout_horizons_sec: [10, 60]
 
 risk:
-  max_total_exposure_usd: 200  # cut from 500: deployment is opportunity-limited,
-                               # not capital-limited; bigger book only added variance
-  max_total_exposure_ceiling: 200  # hard book ceiling (never exceed even when scaled up)
-  kill_switch_loss_usd: 100    # cut from 300: drawdowns are far smaller at the new caps
-  kill_switch_loss_frac: 0.30 # session drawdown stop = this fraction of session-start equity
-  kill_switch_loss_cap_usd: 500  # ceiling on the proportional kill limit
+  max_total_exposure_usd: 100  # $1000 tier OPTIMISED: the binding risk lever. The
+                               # seed sweep tested THIS value (exp100) as the
+                               # largest full-window exposure cap whose worst-case
+                               # 2-month drawdown stayed under $1000 on all seeds.
+  max_total_exposure_ceiling: 150  # hard book ceiling even when equity-scaled up.
+                               # Only reached if equity grows to ~$2250 (sqrt
+                               # scaling), where 150 is again a safe fraction.
+  kill_switch_loss_usd: 100    # floor: minimum absolute session drawdown stop (~10%)
+  kill_switch_loss_frac: 0.30  # session drawdown stop = this fraction of session-start equity
+  kill_switch_loss_cap_usd: 300  # ceiling on the proportional kill limit (~30% of $1000).
+                               # This is the live backstop the backtest does NOT
+                               # model: a session halts at -$300 long before any
+                               # 2-month cumulative drawdown could approach $1000.
   max_feed_age_sec: 5          # pull all quotes if the price feed stalls this long
   vol_warmup_sec: 90           # no sniper/scalper trades until the vol EWMA has
                                # this many seconds of samples. At cold start vol
@@ -277,13 +318,16 @@ sizing:
   # Exposure scales the same way, capped at risk.max_total_exposure_ceiling.
   enabled: true
   mode: sqrt                   # sqrt(equity/ref) or step at equity_tiers
-  reference_equity: 1000       # defaults to paper.starting_cash if omitted
+  reference_equity: 1000       # the $1000 baseline these caps were tuned around.
+                               # In --live with seed_from_wallet the wallet-read
+                               # equity overrides this; keep it ~= your funded
+                               # balance so scaling pivots around real capital.
   min_scale: 0.5               # never shrink below 50% of base caps on drawdown
-  equity_tiers: [2500, 5000, 10000]   # step mode only
-  tier_multipliers: [1.0, 1.25, 1.5, 2.0]  # below $2.5k, then each tier
-  max_take_usd_cap: 90         # cut from 500 so equity-scaling can't re-inflate
-                               # takes back into the adversely-selected size range
-  max_position_usd_cap: 120    # cut from 500 (matches the tightened per-market cap)
+  equity_tiers: [2000, 4000, 10000]   # step mode only (scaled for the $1000 tier)
+  tier_multipliers: [1.0, 1.25, 1.5, 2.0]  # below $2000, then each tier
+  max_take_usd_cap: 32         # absolute ceiling on scaled snipe/scalp takes
+                               # (2x base; matches the per-market cap)
+  max_position_usd_cap: 64     # absolute ceiling on per-market snipe cost (2x base)
   scale_exposure: true         # scale max_total_exposure_usd with equity scale
 
 presign:
@@ -310,7 +354,7 @@ presign:
   enabled: false
   refresh_sec: 2.0           # rebuild/refresh the ladder this often
   price_radius_ticks: 1      # pre-sign +/- this many ticks around the live best ask
-  amount_buckets_usd: [25, 50, 75, 100]  # collateral stake buckets to pre-sign
+  amount_buckets_usd: [5, 10, 15, 30]  # collateral stake buckets to pre-sign ($1000 tier)
   amount_tol: 0.7            # fast path only if a bucket is >= this fraction of desired stake
   max_age_sec: 45            # drop pre-signed orders older than this (kept fresh vs the book)
 
@@ -337,6 +381,8 @@ fak_monitor:
                                # can't otherwise refresh while takers are paused.
 
 paper:
+  # IGNORED in --live mode: the equity baseline is read from the wallet
+  # (live.seed_from_wallet). Only used for paper runs against this config.
   starting_cash: 1000
   # execution realism. Taker (snipe/scalp) orders model the itode speed-bump
   # mechanism: total tick-to-trade budget is taker_latency_ms (Binance-Tokyo
@@ -378,6 +424,10 @@ live:
   # wallet. Confirmed type 3 for this funder via `python -m bot.sigtype_probe`
   # (the only type the maker isn't rejected on). Requires POLYMARKET_FUNDER.
   signature_type: 3
+  # Seed the equity baseline (kill switch + sizing reference) from the wallet's
+  # real pUSD collateral at startup instead of paper.starting_cash. Set false to
+  # fall back to the configured starting_cash.
+  seed_from_wallet: true
   # public Polygon RPC for on-chain merge/redeem. polygon-rpc.com now returns
   # 401, so default to publicnode; swap in a private RPC (Alchemy/Infura) for
   # production reliability from your Dublin box.
