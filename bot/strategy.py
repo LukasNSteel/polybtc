@@ -444,6 +444,22 @@ class Strategy:
         net = p.up * p_up - p.dn * (1 - p_up)
         return max(-1.0, min(1.0, net / cap))
 
+    def _distance_to_strike(self, m: Market, side: str) -> tuple[float | None, float | None]:
+        """Signed distance from the candle open to current spot, toward `side`,
+        as (sigma, dollars). sigma = log(spot/open)/(vol*sqrt(t_rem)) — the same
+        `d` that drives prob_up in fair_value. Positive = spot has already moved
+        the bet's way. Returns (None, None) if any input is missing. Pure
+        observation: nothing in the trading path reads this."""
+        spot = self.binance.price
+        openp = m.open_price
+        vps = self.binance.vol_per_sec
+        tr = max(m.t_remaining, 1e-9)
+        if not spot or not openp or not vps or vps <= 0:
+            return None, None
+        d = math.log(spot / openp) / (vps * math.sqrt(tr))
+        sgn = 1.0 if side == "up" else -1.0
+        return round(sgn * d, 3), round(sgn * (spot - openp), 2)
+
     # ---------- legs ----------
 
     async def _market_make(self, m: Market, p_up: float) -> None:
@@ -644,20 +660,38 @@ class Strategy:
                              m.title, side.upper(), net_edge, max_edge)
                 continue
             if net_edge > min_edge:
-                # size proportional to conviction: full size at 2x min_edge
-                conviction = min(1.0, net_edge / (2 * min_edge))
-                usd = min(caps["max_take_usd"] * max(0.25, conviction), ask_px * ask_sz)
+                if c.get("flat_size", False):
+                    # winner's curse: a bigger modeled edge correlates with model
+                    # ERROR, not opportunity (edge>=0.15 went ~0-for-7 live), so do
+                    # NOT scale stake with edge — that put the most capital on the
+                    # worst bets. Flat fraction of max_take within the kept band,
+                    # still capped by the displayed book size.
+                    usd = min(caps["max_take_usd"] * c.get("size_frac", 0.5),
+                              ask_px * ask_sz)
+                else:
+                    # size proportional to conviction: full size at 2x min_edge
+                    conviction = min(1.0, net_edge / (2 * min_edge))
+                    usd = min(caps["max_take_usd"] * max(0.25, conviction), ask_px * ask_sz)
                 shares = max(usd / ask_px, MIN_SHARES)
                 if (self._exposure_ok(usd)
                         and self._position_cost(m.slug) + usd <= per_mkt_cap
                         and self._cooled(m.slug, "snipe", side, snipe_cd)):
                     limit_px = (round_tick(min(ask_px + slack, 1.0 - m.tick), m.tick)
                                 if slack else ask_px)
+                    # distance-to-strike at fire time, OBSERVATION ONLY (no gate):
+                    # how far spot has moved in this bet's favour, in sigma of the
+                    # remaining-horizon move and in dollars. Logged into the shadow
+                    # record so we can validate a distance gate on real fills before
+                    # ever committing to one. Never affects the order.
+                    dist_sigma, dist_usd = self._distance_to_strike(m, side)
                     log.info("SNIPE %s %s: ask %.3f (limit %.3f) + fee %.4f vs "
-                             "robust %.3f (blend %.3f, edge %.3f, $%.0f)",
+                             "robust %.3f (blend %.3f, edge %.3f, $%.0f, dσ %s)",
                              m.title, side.upper(), ask_px, limit_px, fee, robust,
-                             fair, net_edge, usd)
-                    await self.exec.place_buy(m, side, limit_px, shares, leg="snipe")
+                             fair, net_edge, usd,
+                             f"{dist_sigma:.2f}" if dist_sigma is not None else "na")
+                    await self.exec.place_buy(
+                        m, side, limit_px, shares, leg="snipe",
+                        extra={"dist_sigma": dist_sigma, "dist_usd": dist_usd})
 
     async def _scalp(self, m: Market, p_up: float, caps: dict) -> None:
         c = self.cfg["scalper"]

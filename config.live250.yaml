@@ -159,11 +159,26 @@ sniper:
   enabled: true
   min_edge: 0.10               # gate on the dual-beta ROBUST edge (worst-case
                                # P across both regimes)
-  max_edge: 0.20               # winner's-curse veto, TIGHTENED 0.25->0.20 (Binance
-                               # replay w/ contention+feed_lag: same PnL, ~1/3 less
-                               # drawdown). A giant edge still on the book 350ms
-                               # after the move is one the fast bots passed on;
-                               # live edge>=0.15 fills went 0-for-5 (-104%/$1).
+  max_edge: 0.15               # winner's-curse veto, TIGHTENED 0.20->0.15 (2026-06-24
+                               # live review). A giant edge still on the book 350ms
+                               # after the move is one the fast bots passed on; it is
+                               # usually OUR Binance model disagreeing with the real
+                               # (Chainlink) resolution on a coin-flip close, not a
+                               # real mispricing. edge>=0.15 fills are now ~0-for-7
+                               # live: the prior 0-for-5 note PLUS this session's two
+                               # settled losers at edge 0.178 and 0.189 (both
+                               # max-sized, both lost the full stake) while all six
+                               # winners sat at edge <=0.145.
+  flat_size: true              # 2026-06-24: do NOT ramp stake with edge. The old
+                               # conviction = net_edge/(2*min_edge) sizing put the
+                               # MOST capital on the highest-edge fires — exactly the
+                               # winner's-curse losers. Flat stake within the kept
+                               # (min_edge, max_edge] band decouples size from a model
+                               # that is least trustworthy precisely when it screams
+                               # loudest. Still capped by displayed book size.
+  size_frac: 0.5               # flat stake = this fraction of the (tier-scaled)
+                               # max_take_usd; 0.5 * $20 = $10/snipe at the $250 tier,
+                               # in line with the winning fills' observed $10-14 range.
   robust_betas: [0.83, 1.36]   # lead-stickiness regimes fitted per-day on 1,847
                                # markets: ~0.8-0.9 mean-reversion days, ~1.2-1.4
                                # momentum days. Entry must be +EV under BOTH.
@@ -388,7 +403,9 @@ paper:
   # gone and the FAK is rejected; if it cheapened (BTC moved against us) we are
   # committed and filled anyway — adverse selection. Set taker_latency_ms 0 to
   # restore instant (optimistic) fills.
-  taker_latency_ms: 410      # top of the identified tick-to-trade range (was 350)
+  taker_latency_ms: 600      # 2026-06-24: recalibrated 410->600 from the live shadow
+                             # log (submit->ack median ~570-680ms, n=54). The wire is
+                             # ~1ms; this is Polymarket's server-side FAK matching time.
   speed_bump_ms: 250         # mandatory uncancellable itode hold (subset of the budget)
   cancel_latency_ms: 150     # applies to resting MM (GTC) quotes only
 
@@ -400,10 +417,15 @@ paper:
   # once the shadow logger reports your real fill-capture rate.
   fill_realism:
     enabled: true
-    capture: 0.30            # avg fraction of displayed top-of-book size we win
+    # 2026-06-24: recalibrated from the live shadow log (n=54, ROADMAP P0.2).
+    # Live fill rate 28% (paper implied ~80%) and median capture ~9% (paper
+    # assumed 30%) — paper was optimistic on both fill frequency and size.
+    capture: 0.10            # was 0.30. Live shadow capture median ~9.3% of the
+                             # displayed size; near mid, edge_contention barely bites.
     edge_contention: true    # richer (more underpriced) quotes are more contested:
                              # capture scales to ~0 as the discount to mid hits ~10c
-    race_loss_prob: 0.20     # chance a faster arb takes the whole quote first (miss)
+    race_loss_prob: 0.72     # was 0.20. Live no-fill 72% (15/54 FAKs filled); almost
+                             # all "no orders found to match" — quote gone by ack.
     feed_lag_ms: 150         # our WS book trails the engine; re-validate vs a book
                              # this much fresher (favourable moves richen away)
 

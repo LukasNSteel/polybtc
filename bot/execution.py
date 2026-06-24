@@ -605,7 +605,9 @@ class PaperExecutor:
         self.portfolio.on_fill(market, outcome, ask[0], fill_sz, taker=True, leg=leg)
 
     async def place_buy(self, market: Market, outcome: str, price: float, shares: float,
-                        leg: str = "mm") -> str | None:
+                        leg: str = "mm", extra: dict | None = None) -> str | None:
+        # `extra` is observation-only metadata (e.g. distance-to-strike) used by
+        # the live shadow logger; paper mode has no shadow logger, so ignore it.
         if shares < MIN_SHARES:
             return None
         token = market.token_up if outcome == "up" else market.token_down
@@ -837,7 +839,7 @@ class LiveExecutor:
             log.debug("taker timing stamp failed: %s", e)
 
     async def place_buy(self, market: Market, outcome: str, price: float, shares: float,
-                        leg: str = "mm") -> str | None:
+                        leg: str = "mm", extra: dict | None = None) -> str | None:
         from py_clob_client_v2 import (
             MarketOrderArgs, OrderArgs, OrderType, PartialCreateOrderOptions, Side,
         )
@@ -880,7 +882,8 @@ class LiveExecutor:
         self.fak_stats.record_attempt()
         # shadow logger: snapshot the book we're acting on and start the latency
         # clock right before submission (ROADMAP P0.2). No-op if not wired.
-        shadow_attempt = (self.shadow.on_submit(market, outcome, token, price, shares, leg)
+        shadow_attempt = (self.shadow.on_submit(market, outcome, token, price, shares, leg,
+                                                extra=extra)
                           if self.shadow is not None else None)
         # fast path: a pre-signed order whose stake bucket is <= the desired
         # stake (never oversizes) and within tolerance keeps EIP-712 signing

@@ -76,12 +76,17 @@ class ShadowTakerLogger:
     # ---------- lifecycle ----------
 
     def on_submit(self, market, outcome: str, token: str, limit_px: float,
-                  shares: float, leg: str) -> dict[str, Any] | None:
+                  shares: float, leg: str,
+                  extra: dict[str, Any] | None = None) -> dict[str, Any] | None:
         """Snapshot what we saw and start the latency clock. Returns an opaque
-        attempt handle to pass back to on_result (None on any failure)."""
+        attempt handle to pass back to on_result (None on any failure).
+
+        `extra` carries pure-observation fields the caller computed at fire time
+        (e.g. distance-to-strike: dist_sigma / dist_usd) so they land in the same
+        record as the fill outcome. None values are dropped."""
         try:
             seen = self._snapshot(token)
-            return {
+            rec = {
                 "id": next(self._ids),
                 "_t0": time.monotonic(),
                 "ts": round(time.time(), 3),
@@ -101,6 +106,9 @@ class ShadowTakerLogger:
                 "seen_mid": seen["mid"],
                 "book_age_ms": seen["book_age_ms"],
             }
+            if extra:
+                rec.update({k: v for k, v in extra.items() if v is not None})
+            return rec
         except Exception as e:  # noqa: BLE001 — never let observation break a trade
             log.debug("shadow on_submit failed: %s", e)
             return None

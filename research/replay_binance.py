@@ -158,8 +158,11 @@ def classify_kind(dur):
     return labels[idx]
 
 
-# ---------------------------------------------------------------- main
-def run(cfg, base, price, vol, ticks, obi=None):
+# ---------------------------------------------------------------- features
+def compute_features(cfg, base, price, vol, ticks, obi=None):
+    """Re-implement the live model over every in-window book tick and return the
+    full feature/candidate arrays. Shared by run() (the fill simulator) and the
+    distance-gate diagnostic, so both use IDENTICAL model math."""
     s = ticks["t"]
     inb = (s >= base) & (s < base + len(price))
     d = {k: v[inb] for k, v in ticks.items()}
@@ -172,6 +175,15 @@ def run(cfg, base, price, vol, ticks, obi=None):
     t_rem = (d["end_ep"] - s).astype(float)
     kind = classify_kind(d["end_ep"] - d["start_ep"])
     rr = np.log(spot / price[np.clip(ix - 60, 0, len(price) - 1)])
+
+    # DISTANCE-TO-STRIKE features (the physical state, independent of the model
+    # edge): how far spot has already moved from the candle open, expressed in
+    # standard deviations of the remaining-horizon move (signed; >0 favors UP)
+    # and in raw dollars (signed; >0 favors UP). dist_sigma is exactly the `d`
+    # that drives prob_up in bot/fair_value.py (no drift term — the pure state).
+    sd = vv * np.sqrt(np.maximum(t_rem, 1e-9))
+    dist_sigma = np.log(spot / openp) / sd
+    dist_usd = spot - openp
 
     mom_beta = 0.5
     drift = mom_beta * rr * np.minimum(t_rem, 60) / 60
@@ -227,8 +239,34 @@ def run(cfg, base, price, vol, ticks, obi=None):
             keep = ~km | ok  # outside this kind -> untouched; inside -> must pass
             cand_up &= keep
             cand_dn &= keep
+    # DISTANCE-TO-STRIKE gate (the hypothesis under test): only fire when spot
+    # has already moved in the bet's favour by >= this many sigma and/or dollars.
+    if cfg.get("dist_sigma_min"):
+        th = cfg["dist_sigma_min"]
+        cand_up &= dist_sigma >= th
+        cand_dn &= dist_sigma <= -th
+    if cfg.get("dist_usd_min"):
+        th = cfg["dist_usd_min"]
+        cand_up &= dist_usd >= th
+        cand_dn &= dist_usd <= -th
+
+    return dict(s=s, d=d, ob=ob, t_rem=t_rem, kind=kind, spot=spot, openp=openp,
+                p_up=p_up, p_lo=p_lo, p_hi=p_hi, au=au, ad=ad,
+                edge_up=edge_up, edge_dn=edge_dn, cand_up=cand_up, cand_dn=cand_dn,
+                dist_sigma=dist_sigma, dist_usd=dist_usd)
+
+
+# ---------------------------------------------------------------- main
+def run(cfg, base, price, vol, ticks, obi=None):
+    F = compute_features(cfg, base, price, vol, ticks, obi)
+    s, d = F["s"], F["d"]
+    ob, t_rem, kind = F["ob"], F["t_rem"], F["kind"]
+    au, ad = F["au"], F["ad"]
+    edge_up, edge_dn = F["edge_up"], F["edge_dn"]
+    cand_up, cand_dn = F["cand_up"], F["cand_dn"]
     cand = cand_up | cand_dn
     ci = np.where(cand)[0]
+    me = cfg["min_edge"]  # used by the conviction sizing below
 
     rng = np.random.default_rng(cfg.get("seed", 7))
     race = cfg.get("race_loss", 0.20)

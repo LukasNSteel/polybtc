@@ -1,4 +1,22 @@
-# polybtc bot configuration
+# polybtc bot configuration — $165 LIVE tier (capital-recalibrated 2026-06-24)
+#
+# Forked from config.live250.yaml after the account drew down to ~$165 (from a
+# $250 nominal start). Run with:  python -m bot.main --config config.live165.yaml --live
+#
+# WHY THIS EXISTS / WHAT CHANGED vs live250:
+#   The live taker strategy is currently NET-NEGATIVE (25 settled trades:
+#   -$46.55; the 10 trades since the max_edge/flat-size fix: 4W-6L, -$37).
+#   This config does NOT claim to fix the edge — it is CAPITAL PRESERVATION
+#   sized to the real ~$165 balance so a losing streak can't compound:
+#     * per-snipe stake  $10 -> $5   (max_take_usd 10, size_frac 0.5)
+#     * per-market cap    $40 -> $10  (kills the multi-fill stacking that
+#                                      built the -$19.90 loser)
+#     * total exposure   $125 -> $60  (~36% of bankroll, was ~50% of $250)
+#     * kill switch   $40/30%/$75 -> $25/20%/$33 (stop a bad day fast)
+#     * reference_equity null -> 165  (scale pivots on real capital, not the
+#                                      stale $205 wallet re-seed)
+# The strategic fix (taker race is unwinnable at ~600ms server matching; go
+# maker, or pause) is unchanged and still recommended — see the review canvas.
 
 asset: BTC
 binance_symbol: BTCUSDT
@@ -150,12 +168,26 @@ sniper:
   enabled: true
   min_edge: 0.10               # gate on the dual-beta ROBUST edge (worst-case
                                # P across both regimes)
-  max_edge: 0.20               # winner's-curse veto, TIGHTENED 0.25->0.20: with
-                               # edge_contention+feed_lag modeled, the Binance
-                               # replay shows 0.20 keeps ~all the PnL of 0.25 but
-                               # cuts max drawdown ~1/3 (pnl/DD 3.0 vs 2.0). A
-                               # giant edge still on the book is one the fast bots
-                               # passed on; live edge>=0.15 fills went 0-for-5.
+  max_edge: 0.15               # winner's-curse veto, TIGHTENED 0.20->0.15 (2026-06-24
+                               # live review). A giant edge still on the book 350ms
+                               # after the move is one the fast bots passed on; it is
+                               # usually OUR Binance model disagreeing with the real
+                               # (Chainlink) resolution on a coin-flip close, not a
+                               # real mispricing. edge>=0.15 fills are now ~0-for-7
+                               # live: the prior 0-for-5 note PLUS this session's two
+                               # settled losers at edge 0.178 and 0.189 (both
+                               # max-sized, both lost the full stake) while all six
+                               # winners sat at edge <=0.145.
+  flat_size: true              # 2026-06-24: do NOT ramp stake with edge. The old
+                               # conviction = net_edge/(2*min_edge) sizing put the
+                               # MOST capital on the highest-edge fires — exactly the
+                               # winner's-curse losers. Flat stake within the kept
+                               # (min_edge, max_edge] band decouples size from a model
+                               # that is least trustworthy precisely when it screams
+                               # loudest. Still capped by displayed book size.
+  size_frac: 0.5               # flat stake = this fraction of the (tier-scaled)
+                               # max_take_usd; 0.5 * $10 = $5/snipe at this $165 tier
+                               # (~3% of bankroll), down from $10 at the $250 tier.
   robust_betas: [0.83, 1.36]   # lead-stickiness regimes fitted per-day on 1,847
                                # markets: ~0.8-0.9 mean-reversion days, ~1.2-1.4
                                # momentum days. Entry must be +EV under BOTH.
@@ -166,41 +198,51 @@ sniper:
   max_ask: 0.80                # above this the snipe edge was fee-dead live
                                # (-21.6%); near-certainty buys belong to the
                                # scalper and its 0.997 probability gate
-  max_take_usd: 30             # cut from 100: the cross-method study (paper-log
-                               # resize, 8-week parquet liquidity, Binance replay)
-                               # showed big takes are adversely selected and
-                               # unfillable late; ~$30 ~ median late ask liquidity
-  max_position_usd: 60         # cut from 150: ~2 takes/market; caps the loss tail
-  # PER-KIND late-window gate (supersedes the old single 60s gate, which was a
-  # 5m-only result — the parquet replay archive has no 15m/1h/4h markets). Fitted
-  # on real long-market data in research/test_longmkts_windows.py:
-  #   5m : FULL window  - every t_rem band +EV; gating only sheds PnL.
-  #   15m: FULL window  - like 5m: early band (600-900s) is +28-30%/$1 & spread-
-  #                        robust; gating just sheds ~28% gross PnL for a small DD cut.
-  #   1h : last 900s    - (900,1800]s band weak (+9%/$1) & not spread-robust.
-  #   4h : last 300s    - early/mid window NEGATIVE under spread; edge in last ~5min.
+  max_take_usd: 10             # $165 tier: 20->10. With size_frac 0.5 that is a flat
+                               # $5/snipe (~3% of bankroll).
+  max_position_usd: 10         # per-market snipe cost cap: 40->10. With max_inventory_frac
+                               # this caps a market at ~one $5 snipe per side, killing the
+                               # multi-fill stacking that built the $19.90 loser.
+  # PER-KIND late-window gate (supersedes the old single 30s gate). The windows
+  # are the EDGE-LOCATION result from research/test_longmkts_windows.py on real
+  # 15m/1h/4h data (the parquet archive is 5m-only):
+  #   5m : FULL window   15m: FULL window   1h: last 900s   4h: last 300s
+  #   (15m early band is +28-30%/$1 & spread-robust, so it stays full like 5m)
+  # CAVEAT FOR THE $250 TIER: these ceilings were fitted at the $1000-optimised
+  # caps and are LOOSER than the old 30s gate, so they trade more of each window
+  # and carry MORE drawdown. The 30s gate existed because at $250 the wider 5m
+  # full-window drawdown was ~294% of capital (kill-switch death). If you run
+  # this tier live and see drawdown stress, tighten these (e.g. 5m->30/60,
+  # 15m->120, 1h->300, 4h->180) — the edge per $ only improves as you gate later.
   # A kind key overrides the global max_t_rem_sec; 0/unset = full window.
   max_t_rem_sec: 0             # global fallback (0 = full window)
   max_t_rem_sec_5m: 0          # 5m: full window
   max_t_rem_sec_15m: 0         # 15m: full window
   max_t_rem_sec_hourly: 900    # 1h: last 15 min
   max_t_rem_sec_4h: 300        # 4h: last 5 min
-  min_t_rem_sec: 0             # 0 = trade down to settlement. Don't push above
-                               # ~10s: the final-seconds edge is real live but
-                               # model-unstable in backtest (vol*sqrt(t)->0).
-  # SETTLEMENT-SAFETY CUTOFF: refuse to snipe inside the final N seconds before
-  # close, where the book gaps as the outcome resolves and a marketable FAK
-  # fills the collapsing side below the quoted ask (against the favourite the
-  # min_ask gate is meant to enforce). Distinct from min_t_rem_sec; composes
-  # with it (effective floor = larger of the two). Per-kind overrides global.
-  close_buffer_sec: 20
+  min_t_rem_sec: 0             # 0 = trade down to settlement (see $1k config).
+  # SETTLEMENT-SAFETY CUTOFF (added June 23 after live session 1782200216).
+  # Refuse to snipe inside the final N seconds before close. This is a SAFETY
+  # guard, distinct from the edge gate above: in the last few seconds the book
+  # gaps as the outcome resolves, so a marketable FAK sized off the book we saw
+  # lands ~100ms+ later on the COLLAPSING side and fills well below the quoted
+  # ask — i.e. on the underdog the min_ask favourite gate is meant to exclude.
+  # That is exactly how two live snipes that passed the favourite gate (quotes
+  # 0.50 / 0.73) still filled as underdogs (0.35 / 0.19) 1-3s before close and
+  # lost. The favourite-only rule only holds if we never take into this gap.
+  # Mirrors the scalper's min_tau_sec resolution buffer. Per-kind overrides the
+  # global; 0/unset = no buffer (legacy). Composes with min_t_rem_sec (the
+  # effective floor is the larger of the two).
+  close_buffer_sec: 20         # global fallback
   close_buffer_sec_5m: 20
   close_buffer_sec_15m: 25
   close_buffer_sec_hourly: 45
   close_buffer_sec_4h: 60
-  max_book_age_sec: 3          # never snipe off a WS book older than this; the
-                               # favourite gate only means something on a current
-                               # book (was an implicit 15s).
+  max_book_age_sec: 3          # never snipe off a WS order book older than this
+                               # (was an implicit 15s). The favourite gate reads
+                               # the displayed ask, so it is only meaningful on a
+                               # CURRENT book — a stale snapshot is how a
+                               # pre-collapse ask passes the gate.
   max_inventory_frac: 0.25     # skip a side once net same-side inventory exceeds
                                # this fraction of max_position_usd: stacking one
                                # side on the same lagging signal built every
@@ -232,7 +274,7 @@ scalper:
                                # argument (it can also see the resolution source)
   max_price: 0.99              # was 0.999: above 0.99 the fee eats the entire
                                # edge (+0.3-0.6%/$1 at best, n.s.)
-  max_usd: 100                 # max USDC per scalp
+  max_usd: 10                  # $165 tier: max USDC per scalp (25->10)
   limit_slack_ticks: 2         # FAK limit tolerance (ticks); capped at max_price
                                # so a probe never pays past the tested band
 
@@ -270,12 +312,11 @@ guards:
   markout_horizons_sec: [10, 60]
 
 risk:
-  max_total_exposure_usd: 200  # cut from 500: deployment is opportunity-limited,
-                               # not capital-limited; bigger book only added variance
-  max_total_exposure_ceiling: 200  # hard book ceiling (never exceed even when scaled up)
-  kill_switch_loss_usd: 100    # cut from 300: drawdowns are far smaller at the new caps
-  kill_switch_loss_frac: 0.30 # session drawdown stop = this fraction of session-start equity
-  kill_switch_loss_cap_usd: 500  # ceiling on the proportional kill limit
+  max_total_exposure_usd: 60   # $165 tier: ~36% of bankroll deployed at once (was $125)
+  max_total_exposure_ceiling: 60   # hard book ceiling (never exceed even when scaled up)
+  kill_switch_loss_usd: 25     # floor: minimum absolute session drawdown stop (~15% of $165)
+  kill_switch_loss_frac: 0.20 # session drawdown stop = this fraction of session-start equity
+  kill_switch_loss_cap_usd: 33   # ceiling on the proportional kill limit (~20% of $165)
   max_feed_age_sec: 5          # pull all quotes if the price feed stalls this long
   vol_warmup_sec: 90           # no sniper/scalper trades until the vol EWMA has
                                # this many seconds of samples. At cold start vol
@@ -290,13 +331,14 @@ sizing:
   # Exposure scales the same way, capped at risk.max_total_exposure_ceiling.
   enabled: true
   mode: sqrt                   # sqrt(equity/ref) or step at equity_tiers
-  reference_equity: 1000       # defaults to paper.starting_cash if omitted
+  reference_equity: 165        # pinned to the real ~$165 balance so sqrt scaling
+                               # pivots on current capital, not the stale $205
+                               # wallet re-seed. (was null = follow wallet read)
   min_scale: 0.5               # never shrink below 50% of base caps on drawdown
-  equity_tiers: [2500, 5000, 10000]   # step mode only
-  tier_multipliers: [1.0, 1.25, 1.5, 2.0]  # below $2.5k, then each tier
-  max_take_usd_cap: 90         # cut from 500 so equity-scaling can't re-inflate
-                               # takes back into the adversely-selected size range
-  max_position_usd_cap: 120    # cut from 500 (matches the tightened per-market cap)
+  equity_tiers: [500, 1000, 2500]     # step mode only (mode is sqrt; unused)
+  tier_multipliers: [1.0, 1.25, 1.5, 2.0]  # below $500, then each tier
+  max_take_usd_cap: 12         # absolute ceiling on scaled snipe/scalp takes (was 125)
+  max_position_usd_cap: 15     # absolute ceiling on per-market snipe cost (was 125)
   scale_exposure: true         # scale max_total_exposure_usd with equity scale
 
 presign:
@@ -320,10 +362,16 @@ presign:
   # OFF by default: turning it on means a fast-path snipe snaps its stake
   # DOWN to the nearest pre-signed bucket. Tune the buckets to your real
   # snipe/scalp stake range (sniper.max_take_usd, scalper.max_usd).
-  enabled: false
+  enabled: true              # ON (2026-06-23): shadow log showed ~1.5s submit->ack
+                             # vs ~1ms network RTT — the cost is client-side order
+                             # BUILD (create_market_order), not the wire. Pre-signing
+                             # moves that build off the hot path so a snipe is just
+                             # the POST. The TAKER TIMING probe + analyze_shadow
+                             # (build vs post, by presigned) measure the win directly.
   refresh_sec: 2.0           # rebuild/refresh the ladder this often
   price_radius_ticks: 1      # pre-sign +/- this many ticks around the live best ask
-  amount_buckets_usd: [25, 50, 75, 100]  # collateral stake buckets to pre-sign
+  amount_buckets_usd: [5, 10, 15, 20, 25]  # added 20 to match sniper.max_take_usd
+                             # (was [5,10,15,25]); reduces fast-path stake snap-down
   amount_tol: 0.7            # fast path only if a bucket is >= this fraction of desired stake
   max_age_sec: 45            # drop pre-signed orders older than this (kept fresh vs the book)
 
@@ -350,7 +398,9 @@ fak_monitor:
                                # can't otherwise refresh while takers are paused.
 
 paper:
-  starting_cash: 1000
+  # IGNORED in --live mode: the equity baseline is read from the wallet
+  # (live.seed_from_wallet). Only used for paper runs against this config.
+  starting_cash: 165
   # execution realism. Taker (snipe/scalp) orders model the itode speed-bump
   # mechanism: total tick-to-trade budget is taker_latency_ms (Binance-Tokyo
   # signal travel + Dublin decide/submit + the mandatory speed bump). The last
@@ -376,18 +426,14 @@ paper:
   fill_realism:
     enabled: true
     # 2026-06-24: recalibrated from the live shadow log (n=54, ROADMAP P0.2).
-    # Live fill rate was 28% (paper had implied ~80%) and median capture-when-
-    # filled ~9% (paper assumed 30%) — paper was optimistic on BOTH how often
-    # we fill and how much we get, the dominant reason paper PnL overstated live.
+    # Live fill rate 28% (paper implied ~80%) and median capture ~9% (paper
+    # assumed 30%) — paper was optimistic on both fill frequency and size.
     capture: 0.10            # was 0.30. Live shadow capture median ~9.3% of the
-                             # displayed top-of-book size. For our favourite snipes
-                             # the ask sits near mid, so edge_contention barely bites
-                             # and net capture ~= this base.
+                             # displayed size; near mid, edge_contention barely bites.
     edge_contention: true    # richer (more underpriced) quotes are more contested:
                              # capture scales to ~0 as the discount to mid hits ~10c
-    race_loss_prob: 0.72     # was 0.20. Live no-fill rate 72% (15 fills / 54 FAKs);
-                             # almost all are "no orders found to match" — the quote
-                             # is gone by the time our order is acked ~600ms later.
+    race_loss_prob: 0.72     # was 0.20. Live no-fill 72% (15/54 FAKs filled); almost
+                             # all "no orders found to match" — quote gone by ack.
     feed_lag_ms: 150         # our WS book trails the engine; re-validate vs a book
                              # this much fresher (favourable moves richen away)
 
@@ -402,16 +448,35 @@ live:
   # wallet. Confirmed type 3 for this funder via `python -m bot.sigtype_probe`
   # (the only type the maker isn't rejected on). Requires POLYMARKET_FUNDER.
   signature_type: 3
+  # Seed the equity baseline (kill switch + sizing reference) from the wallet's
+  # real pUSD collateral at startup instead of paper.starting_cash. Set false to
+  # fall back to the configured starting_cash.
+  seed_from_wallet: true
+  # LIVE SETTLEMENT reads the REAL Polymarket resolution (Chainlink/UMA via the
+  # CLOB winner flag / Gamma outcomePrices), NOT the Binance kline. The Binance
+  # proxy disagrees with the real source on coin-flip closes (basis risk) and
+  # booking the wrong winner makes live P&L fiction (observed 2026-06-23: a 0.50
+  # DOWN snipe the bot scored a $21.64 win actually resolved UP / lost). Paper
+  # mode still settles on Binance (the simulator's own truth).
+  resolve_poll_sec: 10       # poll each unresolved expired market this often
+                             # (oracle resolution lags the close by seconds)
+  # Reconcile the bot's internal cash against the real wallet pUSD collateral
+  # every reconcile_sec; log at WARNING if they diverge by more than
+  # reconcile_warn_usd (a growing gap = books drifting from reality).
+  reconcile_sec: 30
+  reconcile_warn_usd: 10.0
   # public Polygon RPC for on-chain merge/redeem. polygon-rpc.com now returns
   # 401, so default to publicnode; swap in a private RPC (Alchemy/Infura) for
   # production reliability from your Dublin box.
   polygon_rpc: https://polygon-bor-rpc.publicnode.com
 
 shadow:
-  # Shadow latency / fill-capture logger (live only): per-FAK seen-book, submit
-  # ->ack latency, fill capture, slippage and post-fill markouts to
-  # logs/shadow_taker.jsonl. Ground truth for the assumed taker latency/capture
-  # knobs (ROADMAP P0.2). Pure observation. Analyse: research/analyze_shadow.py.
+  # Shadow latency / fill-capture logger (live only). Records, per live taker
+  # FAK: the book we saw at submit, submit->ack latency, fill capture vs the
+  # displayed size, slippage, and post-fill mid markouts -> logs/shadow_taker.jsonl.
+  # This is the ground truth (ROADMAP P0.2) that should replace the paper sim's
+  # ASSUMED taker_latency_ms / speed_bump_ms / capture / race_loss_prob. Pure
+  # observation: no effect on trading. Analyse with research/analyze_shadow.py.
   enabled: true
   markout_horizons_sec: [2, 10]
 
