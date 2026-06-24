@@ -168,16 +168,18 @@ sniper:
   enabled: true
   min_edge: 0.10               # gate on the dual-beta ROBUST edge (worst-case
                                # P across both regimes)
-  max_edge: 0.15               # winner's-curse veto, TIGHTENED 0.20->0.15 (2026-06-24
-                               # live review). A giant edge still on the book 350ms
-                               # after the move is one the fast bots passed on; it is
-                               # usually OUR Binance model disagreeing with the real
-                               # (Chainlink) resolution on a coin-flip close, not a
-                               # real mispricing. edge>=0.15 fills are now ~0-for-7
-                               # live: the prior 0-for-5 note PLUS this session's two
-                               # settled losers at edge 0.178 and 0.189 (both
-                               # max-sized, both lost the full stake) while all six
-                               # winners sat at edge <=0.145.
+  max_edge: 0.30               # winner's-curse veto, LOOSENED 0.15->0.30 (2026-06-24
+                               # post-live165 review). The 0.15 cap was fit on
+                               # live250-era data where the high-edge fires were
+                               # max-sized losers — but that was a SIZING artifact,
+                               # not a signal one. Since the flat-$5 live165 config
+                               # took effect (06:19 UTC), the 0.15 veto has been
+                               # 0-for-4: all four vetoed snipes (edge 0.178, 0.216,
+                               # 0.217, 0.239) would have WON, ~+$7-16 left on the
+                               # table, zero losers avoided. With flat sizing the
+                               # genuine edges are real; only the absurd outliers
+                               # (the lone 0.455, a stale-book artifact) stay vetoed.
+                               # n=4 — revisit once more high-edge fires settle.
   flat_size: true              # 2026-06-24: do NOT ramp stake with edge. The old
                                # conviction = net_edge/(2*min_edge) sizing put the
                                # MOST capital on the highest-edge fires — exactly the
