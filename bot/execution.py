@@ -6,10 +6,12 @@ import json
 import logging
 import os
 import random
+import socket
 import time
 from collections import deque
 from dataclasses import dataclass, field
 
+import httpx
 import websockets
 
 from .markets import Market
@@ -25,6 +27,65 @@ _save_counter = itertools.count()
 # Only escalate a reconnect to WARNING after this many consecutive failures; a
 # routine idle-close that recovers on the next attempt stays at DEBUG.
 WS_WARN_AFTER = 3
+
+
+def _install_warm_clob_http_client() -> bool:
+    """Replace py_clob_client_v2's module-level httpx.Client with one tuned to
+    keep the CLOB connection warm and alive for sparse taker FAKs.
+
+    The packaged client is `httpx.Client(http2=True)` with all defaults, i.e.
+    `keepalive_expiry=5s`. Our FAKs fire minutes apart, so the ONLY thing
+    holding the socket open is the 3s keep-warm ping — and if a single ping is
+    delayed (thread-pool contention, GC, a slow GET) the socket idles out and
+    the next order eats a full cold TLS+HTTP/2 reconnect on the critical path
+    (the multi-second / `Request exception!` submit tails we observed live).
+
+    This swaps in a client that (a) never idle-drops the socket for 2 minutes,
+    (b) turns on OS-level TCP keepalive so a silently-dead NAT/firewall path is
+    detected and re-opened in the background rather than on the next FAK, and
+    (c) caps connect/read so a genuinely dead path fails fast instead of
+    hanging ~5-9s. Idempotent; returns False (and leaves the default in place)
+    if the package layout ever changes."""
+    try:
+        from py_clob_client_v2.http_helpers import helpers as _clob_http
+    except Exception as e:  # noqa: BLE001
+        log.warning("could not tune CLOB http client (%s); using package default", e)
+        return False
+
+    # OS-level TCP keepalive: probe after 15s idle, every 5s, drop after 4 misses.
+    keepalive_opts = [(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)]
+    for name, val in (("TCP_KEEPIDLE", 15), ("TCP_KEEPINTVL", 5), ("TCP_KEEPCNT", 4)):
+        opt = getattr(socket, name, None)
+        if opt is not None:
+            keepalive_opts.append((socket.IPPROTO_TCP, opt, val))
+
+    transport = httpx.HTTPTransport(
+        http2=True,
+        retries=0,
+        socket_options=keepalive_opts,
+        limits=httpx.Limits(
+            max_keepalive_connections=10,
+            max_connections=20,
+            keepalive_expiry=120.0,  # never idle-drop between sparse FAKs
+        ),
+    )
+    warm = httpx.Client(
+        transport=transport,
+        timeout=httpx.Timeout(connect=3.0, read=5.0, write=3.0, pool=2.0),
+        headers={"Connection": "keep-alive"},
+    )
+    old = getattr(_clob_http, "_http_client", None)
+    if old is warm:
+        return True
+    _clob_http._http_client = warm
+    if old is not None:
+        try:
+            old.close()
+        except Exception:  # noqa: BLE001
+            pass
+    log.info("CLOB http client tuned: http2 keep-alive, TCP keepalive on, "
+             "keepalive_expiry=120s, timeout(c3/r5/w3/p2)")
+    return True
 
 
 class FakStats:
@@ -697,6 +758,9 @@ class LiveExecutor:
             kwargs["funder"] = funder
         self.client = ClobClient(host, **kwargs)
         self.client.set_api_creds(self.client.create_or_derive_api_key())
+        # Swap the package's default httpx client for one that holds the CLOB
+        # socket warm/alive between sparse FAKs (see _install_warm_clob_http_client).
+        _install_warm_clob_http_client()
         self.signature_type = signature_type
         self.address = funder or self.client.get_address()
         self.open_orders: dict[str, OpenOrder] = {}
@@ -770,14 +834,15 @@ class LiveExecutor:
         """Keep the shared CLOB HTTP/2 connection warm so a taker FAK is just a
         warm POST, not a fresh TLS+connection setup.
 
-        py_clob_client_v2 sends every order over a module-level httpx.Client
-        whose keep-alive idles out after ~5s (httpx default). Our taker FAKs
-        fire minutes apart and nothing else touches that client between them
-        (market refresh uses a separate aiohttp session; reconcile only runs
-        every 30s), so most snipes pay a cold reconnect on the critical path
-        and inflate the submit->ack tail. A cheap GET /time on the shared
-        client every few seconds keeps the socket open. Read-only; never
-        trades, and a failed ping never stops the bot."""
+        We've raised the shared client's keepalive_expiry to 120s and enabled
+        OS-level TCP keepalive (see _install_warm_clob_http_client), so the
+        socket no longer idle-drops between sparse FAKs on its own. This ping
+        still earns its keep: a cheap GET /time every few seconds keeps NAT /
+        firewall path state alive, exercises the connection so a silently-dead
+        path is detected and re-opened HERE (in the background) rather than on
+        the next order's critical path, and records `_last_warm` so the shadow
+        log can tell a cold-socket POST from genuine server-side matching time.
+        Read-only; never trades, and a failed ping never stops the bot."""
         interval = max(1.0, float(interval_sec))
         while True:
             try:
