@@ -660,6 +660,25 @@ class Strategy:
                              m.title, side.upper(), net_edge, max_edge)
                 continue
             if net_edge > min_edge:
+                # distance-to-strike at fire time: how far spot has moved in this
+                # bet's favour, in sigma of the remaining-horizon move (dist_sigma)
+                # and in dollars (dist_usd). Always logged into the shadow record.
+                dist_sigma, dist_usd = self._distance_to_strike(m, side)
+                # SOFT DISTANCE FLOOR (sniper.dist_sigma_min; unset == no gate).
+                # Live review of 21 dsig-logged fills: entries <0.5σ from strike
+                # won only 33% for -$6.05 net (near-the-money coin-flips), while
+                # >=0.5σ won 72% for +$15.18. The 0.5-1.0σ band is the single most
+                # profitable, so the floor is 0.5 — NOT higher (>=1.0 would cut the
+                # best band). Fail-open: never block when dσ can't be computed
+                # (e.g. missing open/vol), so a stale signal can't halt trading.
+                dist_floor = c.get("dist_sigma_min")
+                if dist_floor and dist_sigma is not None and dist_sigma < dist_floor:
+                    if self._cooled(m.slug, "snipe-dist", side, 30):
+                        log.info("SNIPE SKIP %s %s: dσ %.2f < floor %.2f — "
+                                 "near-the-money coin-flip (live <0.5σ won 33%%, "
+                                 ">=0.5σ won 72%%)",
+                                 m.title, side.upper(), dist_sigma, dist_floor)
+                    continue
                 if c.get("flat_size", False):
                     # winner's curse: a bigger modeled edge correlates with model
                     # ERROR, not opportunity (edge>=0.15 went ~0-for-7 live), so do
@@ -678,12 +697,6 @@ class Strategy:
                         and self._cooled(m.slug, "snipe", side, snipe_cd)):
                     limit_px = (round_tick(min(ask_px + slack, 1.0 - m.tick), m.tick)
                                 if slack else ask_px)
-                    # distance-to-strike at fire time, OBSERVATION ONLY (no gate):
-                    # how far spot has moved in this bet's favour, in sigma of the
-                    # remaining-horizon move and in dollars. Logged into the shadow
-                    # record so we can validate a distance gate on real fills before
-                    # ever committing to one. Never affects the order.
-                    dist_sigma, dist_usd = self._distance_to_strike(m, side)
                     log.info("SNIPE %s %s: ask %.3f (limit %.3f) + fee %.4f vs "
                              "robust %.3f (blend %.3f, edge %.3f, $%.0f, dσ %s)",
                              m.title, side.upper(), ask_px, limit_px, fee, robust,

@@ -190,6 +190,16 @@ sniper:
   size_frac: 0.5               # flat stake = this fraction of the (tier-scaled)
                                # max_take_usd; 0.5 * $10 = $5/snipe at this $165 tier
                                # (~3% of bankroll), down from $10 at the $250 tier.
+  dist_sigma_min: 0.5          # SOFT distance-to-strike floor (2026-06-25). Skip
+                               # snipes where spot is < this many sigma from the
+                               # candle open in the bet's favour. Live review of 21
+                               # dsig-logged fills: <0.5σ entries won 33% (-$6.05
+                               # net, near-the-money coin-flips); >=0.5σ won 72%
+                               # (+$15.18). Floor is 0.5 NOT higher — the 0.5-1.0σ
+                               # band is the single most profitable, so >=1.0 would
+                               # cut winners. Fail-open: no gate when dσ is unknown.
+                               # Unset/0 disables. n=3 in the killed bucket — soft &
+                               # reversible; revisit as more dσ fills settle.
   robust_betas: [0.83, 1.36]   # lead-stickiness regimes fitted per-day on 1,847
                                # markets: ~0.8-0.9 mean-reversion days, ~1.2-1.4
                                # momentum days. Entry must be +EV under BOTH.
