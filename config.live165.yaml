@@ -290,9 +290,14 @@ sniper:
   # POST, only prevent a fire. trend_z is logged on every SNIPE line and into
   # shadow_taker.jsonl, so START CONSERVATIVE and tune DOWN from the live trend_z
   # distribution of winners vs losers. 0 disables the gate (still logged).
-  trend_filter_sigma: 1.5      # block only clear fades (>=1.5σ against the bet)
-                               # for now; the [30,90]s 5m window above carries the
-                               # rest until shadow data pins the right threshold.
+  trend_filter_sigma: 1.0      # tightened 1.5->1.0 (2026-06-26). The 13-week
+                               # parquet replay (research/backtest_proposed.py)
+                               # confirmed "don't fade momentum" is robustly +EV
+                               # and that STRONGER fade-blocking improves ROI/$ in
+                               # every friction regime; 1.0 is the conservative
+                               # step toward that. (Same run REJECTED the max_ask
+                               # 0.65 cut as 47-fill overfit — max_ask stays 0.80.)
+                               # Keep tuning from the live trend_z / shadow record.
   trend_window_sec: 45         # momentum lookback (matches the MM trend filter)
   # SHADOW CANDIDATES (2026-06-25) — observation-only counterfactual logging.
   # Records would-be snipes the live gates DECLINE (outside the live timing

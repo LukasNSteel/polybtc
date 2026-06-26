@@ -250,6 +250,25 @@ def compute_features(cfg, base, price, vol, ticks, obi=None):
         cand_up &= dist_usd >= th
         cand_dn &= dist_usd <= -th
 
+    # TREND FILTER (mirror of bot/strategy.py): skip bets that FADE the recent
+    # run. rr is the 60s log-return; normalise to sigma of the 60s move (rr_z),
+    # then drop a BUY UP when momentum is running down past the threshold, and a
+    # BUY DN when running up past it. trend_filter_sigma=0 == drop ANY fade.
+    if cfg.get("trend_filter_sigma") is not None:
+        sig = cfg["trend_filter_sigma"]
+        rr_z = rr / np.maximum(vv * np.sqrt(60.0), 1e-12)
+        cand_up &= rr_z > -sig
+        cand_dn &= rr_z < sig
+    # optional direction / kind restriction (for the up-only and 5m-only studies)
+    if cfg.get("dir_only") == "up":
+        cand_dn &= False
+    elif cfg.get("dir_only") == "dn":
+        cand_up &= False
+    if cfg.get("kind_only"):
+        keep = kind == cfg["kind_only"]
+        cand_up &= keep
+        cand_dn &= keep
+
     return dict(s=s, d=d, ob=ob, t_rem=t_rem, kind=kind, spot=spot, openp=openp,
                 p_up=p_up, p_lo=p_lo, p_hi=p_hi, au=au, ad=ad,
                 edge_up=edge_up, edge_dn=edge_dn, cand_up=cand_up, cand_dn=cand_dn,

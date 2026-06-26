@@ -20,7 +20,7 @@ from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 from sklearn.model_selection import RepeatedStratifiedKFold, cross_val_score
 from sklearn.metrics import roc_auc_score
 
-FEATURES = ["edge", "dist", "t_rem", "trend_aligned", "is_up"]
+FEATURES = ["edge", "dist", "t_rem", "trend_aligned", "is_up", "ask"]
 SEED = 0
 
 

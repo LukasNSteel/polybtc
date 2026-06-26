@@ -86,17 +86,21 @@ def build_trades():
         risk = sh * px + fee
         pnl = (sh * (1 - px) - fee) if won else -(sh * px + fee)
         trades.append({"dir": r["side"], "edge": edge, "dist": dist,
-                       "won": won, "pnl": pnl, "risk": risk,
-                       "kind": r.get("kind")})
+                       "ask": round(px, 4), "won": won, "pnl": pnl,
+                       "risk": risk, "kind": r.get("kind")})
     return trades
 
 
-def subset(trades, dirf, emin, dlo, dhi):
+def subset(trades, dirf, emin, emax, dlo, dhi, alo, ahi):
     out = []
     for t in trades:
         if dirf != "all" and t["dir"] != dirf:
             continue
-        if t["edge"] < emin or not (dlo <= t["dist"] <= dhi):
+        if not (emin <= t["edge"] <= emax):
+            continue
+        if not (dlo <= t["dist"] <= dhi):
+            continue
+        if not (alo <= t["ask"] <= ahi):
             continue
         out.append(t)
     return out
@@ -109,12 +113,44 @@ def summ(rows):
     return n, w, pnl
 
 
-def report(label, rows, rule):
-    n, w, pnl = summ(rows)
-    wr = f"{w / n * 100:.1f}%" if n else "-"
+NEG, POS = -1e9, 1e9
+
+
+def cuts(vals, lo=True):
+    """~6 quantile cut-points + an open end, so floors/ceilings stay a small grid
+    instead of every unique value (keeps the 7-dim search fast)."""
+    import numpy as np
+    qs = np.quantile(vals, [0.0, 0.2, 0.4, 0.6, 0.8] if lo
+                     else [0.2, 0.4, 0.6, 0.8, 1.0])
+    pts = sorted({round(float(q), 3) for q in qs})
+    return ([NEG] + pts) if lo else (pts + [POS])
+
+
+def rule_str(dirf, emin, emax, dlo, dhi, alo, ahi):
+    parts = []
+    if dirf != "all":
+        parts.append(f"DIR=={dirf.upper()}")
+    if emin > NEG:
+        parts.append(f"EDGE>={emin:.3f}")
+    if emax < POS:
+        parts.append(f"EDGE<={emax:.3f}")
+    if dlo > NEG:
+        parts.append(f"DIST>={dlo:.2f}")
+    if dhi < POS:
+        parts.append(f"DIST<={dhi:.2f}")
+    if alo > NEG:
+        parts.append(f"ASK>={alo:.2f}")
+    if ahi < POS:
+        parts.append(f"ASK<={ahi:.2f}")
+    return " AND ".join(parts) or "no constraint"
+
+
+def report(label, r):
+    rp, rn, rw, *rule = r
+    wr = f"{rw / rn * 100:.1f}%" if rn else "-"
     print(f"  {label}")
-    print(f"    rule: {rule}")
-    print(f"    trades {n}  win {wr} (W{w}/{n - w})  total PnL {pnl:+.2f}\n")
+    print(f"    rule: {rule_str(*rule)}")
+    print(f"    trades {rn}  win {wr} (W{rw}/{rn - rw})  total PnL {rp:+.2f}\n")
 
 
 def main():
@@ -124,70 +160,71 @@ def main():
     for t in trades:
         kinds[t["kind"]] = kinds.get(t["kind"], 0) + 1
     print(f"settled snipe fills: {n}  (kinds: {kinds})")
-    print(f"BASELINE (all trades): win {w / n * 100:.1f}%  total PnL {pnl:+.2f}\n"
-          if n else "no trades")
     if n < 4:
         print("too few trades to grid-search meaningfully.")
         return
+    print(f"BASELINE (all trades): win {w / n * 100:.1f}%  total PnL {pnl:+.2f}\n")
 
-    edges = sorted({round(t["edge"], 3) for t in trades})
-    dists = sorted({round(t["dist"], 2) for t in trades})
-    egrid = [-1.0] + edges
-    dlo_grid = [-1.0] + dists
-    dhi_grid = dists + [99.0]
+    E = [t["edge"] for t in trades]
+    D = [t["dist"] for t in trades]
+    A = [t["ask"] for t in trades]
+    e_lo, e_hi = cuts(E), cuts(E, lo=False)
+    d_lo, d_hi = cuts(D), cuts(D, lo=False)
+    a_lo, a_hi = cuts(A), cuts(A, lo=False)
     MIN_N = 4
 
     results = []
-    for dirf, emin, dlo, dhi in product(("all", "up", "dn"), egrid,
-                                        dlo_grid, dhi_grid):
-        if dlo > dhi:
-            continue
-        rows = subset(trades, dirf, emin, dlo, dhi)
-        if len(rows) < MIN_N:
-            continue
-        rn, rw, rp = summ(rows)
-        results.append((rp, rn, rw, dirf, emin, dlo, dhi, rows))
-
-    def rule_str(dirf, emin, dlo, dhi):
-        parts = []
-        if dirf != "all":
-            parts.append(f"DIR == {dirf.upper()}")
-        if emin > -1.0:
-            parts.append(f"EDGE >= {emin:.3f}")
-        if dlo > -1.0:
-            parts.append(f"DIST >= {dlo:.2f}")
-        if dhi < 99.0:
-            parts.append(f"DIST <= {dhi:.2f}")
-        return " AND ".join(parts) or "no constraint"
+    for dirf in ("all", "up", "dn"):
+        for emin, emax in product(e_lo, e_hi):
+            if emin > emax:
+                continue
+            for dlo, dhi in product(d_lo, d_hi):
+                if dlo > dhi:
+                    continue
+                for alo, ahi in product(a_lo, a_hi):
+                    if alo > ahi:
+                        continue
+                    rows = subset(trades, dirf, emin, emax, dlo, dhi, alo, ahi)
+                    if len(rows) < MIN_N:
+                        continue
+                    rn, rw, rp = summ(rows)
+                    results.append((rp, rn, rw, dirf, emin, emax,
+                                    dlo, dhi, alo, ahi))
+    print(f"(searched {len(results):,} rule sets with n>={MIN_N})\n")
 
     print("=" * 64)
-    best = max(results, key=lambda x: x[0])
-    report("ABSOLUTE MAXIMIZER (highest total PnL, n>=4)",
-           best[7], rule_str(*best[3:7]))
+    report("ABSOLUTE MAXIMIZER (highest total PnL)",
+           max(results, key=lambda x: x[0]))
 
-    zero = [r for r in results if r[2] == r[1]]  # wins == trades
+    zero = [r for r in results if r[2] == r[1]]
     if zero:
-        bz = max(zero, key=lambda x: x[0])
-        report("ZERO-LOSS (100% win rate, max PnL among them, n>=4)",
-               bz[7], rule_str(*bz[3:7]))
+        report("ZERO-LOSS (100% win, max PnL among them)",
+               max(zero, key=lambda x: x[0]))
 
     for d in ("up", "dn"):
         sub = [r for r in results if r[3] == d]
         if sub:
-            bd = max(sub, key=lambda x: x[0])
-            report(f"BEST {d.upper()}-ONLY rule", bd[7], rule_str(*bd[3:7]))
+            report(f"BEST {d.upper()}-ONLY", max(sub, key=lambda x: x[0]))
 
-    donly = [r for r in results if r[3] == "all" and r[4] <= -1.0]
-    if donly:
-        bdo = max(donly, key=lambda x: x[0])
-        report("DIST-ONLY (ignore EDGE)", bdo[7], rule_str(*bdo[3:7]))
+    fav = [r for r in results if r[8] >= 0.50 and r[4] <= NEG and r[5] >= POS]
+    if fav:
+        report("FAVOURITE-STRENGTH only (ASK band, ignore EDGE)",
+               max(fav, key=lambda x: x[0]))
 
     print("=" * 64)
-    print("LOSS STRUCTURE — where the losers sit (edge x dist of losses):")
-    losers = [t for t in trades if not t["won"]]
-    for t in sorted(losers, key=lambda t: t["edge"]):
-        print(f"    L  DIR {t['dir'].upper()}  EDGE {t['edge']:.3f}  "
-              f"DIST {t['dist']:.2f}  pnl {t['pnl']:+.2f}")
+    print("MARGINAL EFFECT of each ceiling alone (vs baseline +%.2f):" % pnl)
+    for label, fn in [
+        ("EDGE <= 0.13", lambda t: t["edge"] <= 0.13),
+        ("DIST <= 1.0", lambda t: t["dist"] <= 1.0),
+        ("DIST <= 1.5", lambda t: t["dist"] <= 1.5),
+        ("ASK <= 0.60", lambda t: t["ask"] <= 0.60),
+        ("ASK <= 0.65", lambda t: t["ask"] <= 0.65),
+        ("ASK in [0.50,0.62]", lambda t: 0.50 <= t["ask"] <= 0.62),
+    ]:
+        rows = [t for t in trades if fn(t)]
+        rn, rw, rp = summ(rows)
+        wr = f"{rw / rn * 100:.0f}%" if rn else "-"
+        print(f"  {label:22} n={rn:>3}  win {wr:>4}  PnL {rp:+.2f}")
 
 
 if __name__ == "__main__":
