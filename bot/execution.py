@@ -1,6 +1,7 @@
 """Order execution: paper simulator (default) and live CLOB executor."""
 
 import asyncio
+import concurrent.futures
 import itertools
 import json
 import logging
@@ -35,7 +36,7 @@ def _install_warm_clob_http_client() -> bool:
 
     The packaged client is `httpx.Client(http2=True)` with all defaults, i.e.
     `keepalive_expiry=5s`. Our FAKs fire minutes apart, so the ONLY thing
-    holding the socket open is the 3s keep-warm ping — and if a single ping is
+    holding the socket open is the ~1s keep-warm ping — and if a single ping is
     delayed (thread-pool contention, GC, a slow GET) the socket idles out and
     the next order eats a full cold TLS+HTTP/2 reconnect on the critical path
     (the multi-second / `Request exception!` submit tails we observed live).
@@ -761,6 +762,14 @@ class LiveExecutor:
         # Swap the package's default httpx client for one that holds the CLOB
         # socket warm/alive between sparse FAKs (see _install_warm_clob_http_client).
         _install_warm_clob_http_client()
+        # Dedicated thread pool for the LATENCY-CRITICAL taker path (build + POST).
+        # asyncio.to_thread shares ONE default executor with keep-warm GETs, the
+        # presigner, cancels and balance syncs; under load a FAK can sit queued
+        # behind them before it even dispatches. A reserved pool guarantees the
+        # order POST starts immediately, and the dispatch_ms split in the shadow
+        # log isolates that queue/GIL wait from the real HTTP round trip (call_ms).
+        self._submit_pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=2, thread_name_prefix="clob-submit")
         self.signature_type = signature_type
         self.address = funder or self.client.get_address()
         self.open_orders: dict[str, OpenOrder] = {}
@@ -830,14 +839,14 @@ class LiveExecutor:
         except (TypeError, ValueError):
             return 0.0
 
-    async def run_keepwarm(self, interval_sec: float = 3.0) -> None:
+    async def run_keepwarm(self, interval_sec: float = 1.0) -> None:
         """Keep the shared CLOB HTTP/2 connection warm so a taker FAK is just a
         warm POST, not a fresh TLS+connection setup.
 
         We've raised the shared client's keepalive_expiry to 120s and enabled
         OS-level TCP keepalive (see _install_warm_clob_http_client), so the
         socket no longer idle-drops between sparse FAKs on its own. This ping
-        still earns its keep: a cheap GET /time every few seconds keeps NAT /
+        still earns its keep: a cheap GET /time ~every second keeps NAT /
         firewall path state alive, exercises the connection so a silently-dead
         path is detected and re-opened HERE (in the background) rather than on
         the next order's critical path, and records `_last_warm` so the shadow
@@ -884,21 +893,46 @@ class LiveExecutor:
 
     @staticmethod
     def _stamp_taker_timing(attempt: dict | None, t_build0: float,
-                            t_build1: float | None, presigned: bool) -> None:
+                            t_build1: float | None, presigned: bool,
+                            post_timing: dict | None = None) -> None:
         """Record, into the shadow attempt, the split of submit->ack latency:
         BUILD (order construction/sign, or a pre-signed lookup) vs POST (the
         post_order HTTP round trip). build_ms is None if create_market_order
-        itself raised before completing. Pure observation — never raises."""
+        itself raised before completing.
+
+        POST is split further when `post_timing` (filled inside the submit-pool
+        worker) is supplied:
+          * dispatch_ms — t_build1 -> worker actually started: time the POST sat
+            queued for a pool thread / blocked on the GIL behind the event loop.
+          * call_ms     — the real post_order round trip inside the worker.
+          * resume_ms   — worker done -> coroutine resumed on the loop: how long
+            the result waited for the event loop to pick it back up.
+        A large dispatch_ms/resume_ms with a small call_ms => the ~400ms tails
+        were event-loop/GIL contention, not the network. Pure observation —
+        never raises."""
         try:
             now = time.monotonic()
             build_ms = round((t_build1 - t_build0) * 1000, 1) if t_build1 else None
             post_ms = round((now - t_build1) * 1000, 1) if t_build1 else None
-            log.info("TAKER TIMING build %s post %s presigned=%s",
+            enter = (post_timing or {}).get("enter")
+            done = (post_timing or {}).get("done")
+            dispatch_ms = (round((enter - t_build1) * 1000, 1)
+                           if (t_build1 and enter) else None)
+            call_ms = round((done - enter) * 1000, 1) if (enter and done) else None
+            resume_ms = round((now - done) * 1000, 1) if done else None
+            log.info("TAKER TIMING build %s post %s (dispatch %s call %s resume %s) "
+                     "presigned=%s",
                      f"{build_ms:.0f}ms" if build_ms is not None else "n/a",
-                     f"{post_ms:.0f}ms" if post_ms is not None else "n/a", presigned)
+                     f"{post_ms:.0f}ms" if post_ms is not None else "n/a",
+                     f"{dispatch_ms:.0f}ms" if dispatch_ms is not None else "n/a",
+                     f"{call_ms:.0f}ms" if call_ms is not None else "n/a",
+                     f"{resume_ms:.0f}ms" if resume_ms is not None else "n/a", presigned)
             if attempt is not None:
                 attempt["build_ms"] = build_ms
                 attempt["post_ms"] = post_ms
+                attempt["dispatch_ms"] = dispatch_ms
+                attempt["call_ms"] = call_ms
+                attempt["resume_ms"] = resume_ms
                 attempt["presigned"] = bool(presigned)
         except Exception as e:  # noqa: BLE001 — never let instrumentation break a trade
             log.debug("taker timing stamp failed: %s", e)
@@ -906,7 +940,7 @@ class LiveExecutor:
     async def place_buy(self, market: Market, outcome: str, price: float, shares: float,
                         leg: str = "mm", extra: dict | None = None) -> str | None:
         from py_clob_client_v2 import (
-            MarketOrderArgs, OrderArgs, OrderType, PartialCreateOrderOptions, Side,
+            OrderArgs, OrderType, PartialCreateOrderOptions, Side,
         )
 
         if shares < MIN_SHARES:
@@ -968,25 +1002,40 @@ class LiveExecutor:
             shadow_attempt["warm_age_ms"] = (round((t_build0 - self._last_warm) * 1000, 1)
                                              if self._last_warm else None)
         t_build1 = None
+        # Both build and POST run on the reserved submit pool (NOT the shared
+        # asyncio.to_thread executor) so a fire is never queued behind keep-warm
+        # / presigner / cancel work. The worker stamps enter/done so the shadow
+        # log can split the post leg into dispatch (queue/GIL wait) vs the real
+        # call vs resume (see _stamp_taker_timing).
+        loop = asyncio.get_running_loop()
+        post_timing: dict[str, float] = {}
+
+        def _post(signed_order):
+            post_timing["enter"] = time.monotonic()
+            try:
+                return self.client.post_order(signed_order, OrderType.FAK)
+            finally:
+                post_timing["done"] = time.monotonic()
+
         try:
             if presigned is not None:
                 signed, used_amount = presigned
             else:
-                signed = await asyncio.to_thread(
-                    self.client.create_market_order,
-                    MarketOrderArgs(token_id=token, amount=used_amount, side=Side.BUY,
-                                    price=price, order_type=OrderType.FAK),
-                    opts)
+                signed = await loop.run_in_executor(
+                    self._submit_pool, self._build_taker_order,
+                    token, used_amount, price, market.neg_risk)
             t_build1 = time.monotonic()
-            resp = await asyncio.to_thread(self.client.post_order, signed, OrderType.FAK)
+            resp = await loop.run_in_executor(self._submit_pool, _post, signed)
         except Exception as e:
-            self._stamp_taker_timing(shadow_attempt, t_build0, t_build1, presigned is not None)
+            self._stamp_taker_timing(shadow_attempt, t_build0, t_build1,
+                                     presigned is not None, post_timing)
             log.warning("taker order rejected: %s", e)
             self.fak_stats.record_kill()
             if self.shadow is not None:
                 self.shadow.on_result(shadow_attempt, 0.0, 0.0, f"rejected: {e}")
             return None
-        self._stamp_taker_timing(shadow_attempt, t_build0, t_build1, presigned is not None)
+        self._stamp_taker_timing(shadow_attempt, t_build0, t_build1,
+                                 presigned is not None, post_timing)
         requested = used_amount / price if price > 0 else shares
         filled = _parse_fill_shares(resp, requested)
         avg = _parse_fill_price(resp, price) if filled > 0 else 0.0

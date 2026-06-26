@@ -605,6 +605,17 @@ class Strategy:
         imbalance = self._inventory_imbalance(m, p_up, cap=per_mkt_cap)
         max_inv = c.get("max_inventory_frac", 0.25)
         pos = self.portfolio.positions.get(m.slug)
+        # TREND FILTER (mirror of the MM leg). Recent momentum in sigma units,
+        # computed ONCE per call from already-collected Binance ticks — pure CPU,
+        # no I/O, and it runs strictly BEFORE place_buy, so it can only PREVENT a
+        # fire, never delay the order POST (the latency-critical path is
+        # untouched). trend_z is logged on every fire (SNIPE line + shadow extra)
+        # so the threshold can be tuned from the live shadow record. Live
+        # forensics: fading a momentum run was the dominant snipe loss driver;
+        # avoiding fades flipped the 5m book strongly +EV (research/
+        # backtest_window_trend.py). 0 == filter off (still logged).
+        trend_z = self._momentum_z(c.get("trend_window_sec", 45.0)) or 0.0
+        trend_sigma = c.get("trend_filter_sigma", 0.0)
         for side, fair, robust, token in (("up", p_up, p_lo, m.token_up),
                                           ("dn", 1 - p_up, 1 - p_hi, m.token_down)):
             # don't stack one side past the inventory fraction: same lagging
@@ -679,6 +690,19 @@ class Strategy:
                                  ">=0.5σ won 72%%)",
                                  m.title, side.upper(), dist_sigma, dist_floor)
                     continue
+                # TREND FILTER gate. Skip bets that FADE a momentum run beyond the
+                # threshold: a BUY UP into a strong down-run, or a BUY DN into a
+                # strong up-run. Conservative default — start wide and tune down
+                # from the shadow trend_z distribution. Fail-open (trend_z=0 when
+                # momentum is unavailable, so a missing signal never halts trading).
+                trending_against = ((side == "up" and trend_z <= -trend_sigma)
+                                    or (side == "dn" and trend_z >= trend_sigma))
+                if trend_sigma > 0 and trending_against:
+                    if self._cooled(m.slug, "snipe-trend", side, 30):
+                        log.info("SNIPE SKIP %s %s: momentum %.2fσ against the bet "
+                                 "(trend_filter %.2f) — not fading the run",
+                                 m.title, side.upper(), trend_z, trend_sigma)
+                    continue
                 if c.get("flat_size", False):
                     # winner's curse: a bigger modeled edge correlates with model
                     # ERROR, not opportunity (edge>=0.15 went ~0-for-7 live), so do
@@ -698,13 +722,103 @@ class Strategy:
                     limit_px = (round_tick(min(ask_px + slack, 1.0 - m.tick), m.tick)
                                 if slack else ask_px)
                     log.info("SNIPE %s %s: ask %.3f (limit %.3f) + fee %.4f vs "
-                             "robust %.3f (blend %.3f, edge %.3f, $%.0f, dσ %s)",
+                             "robust %.3f (blend %.3f, edge %.3f, $%.0f, dσ %s, "
+                             "tz %.2f)",
                              m.title, side.upper(), ask_px, limit_px, fee, robust,
                              fair, net_edge, usd,
-                             f"{dist_sigma:.2f}" if dist_sigma is not None else "na")
+                             f"{dist_sigma:.2f}" if dist_sigma is not None else "na",
+                             trend_z)
                     await self.exec.place_buy(
                         m, side, limit_px, shares, leg="snipe",
-                        extra={"dist_sigma": dist_sigma, "dist_usd": dist_usd})
+                        extra={"dist_sigma": dist_sigma, "dist_usd": dist_usd,
+                               "trend_z": round(trend_z, 3)})
+
+    def _shadow_candidates(self, m: Market, p_up: float, p_lo: float,
+                           p_hi: float) -> None:
+        """OBSERVATION-ONLY counterfactual logger — places NO orders and never
+        touches the submit path. Called AFTER _snipe returns, so it cannot delay a
+        real fire; for markets in the shadow-only band there is no real order at
+        all. Pure CPU (book lookups + arithmetic) plus, at most once per
+        (market,side) per minute, one small JSONL append.
+
+        It re-evaluates the snipe SIGNAL gates (favourite ask, robust edge,
+        distance floor — read from the SAME config keys as _snipe so thresholds
+        can't drift) across a WIDER 'shadow' window than the live timing gate, and
+        records any would-be fire the live config DECLINED:
+          * reason 'window' — the signal qualified but t_remaining is outside the
+            live max_t_rem_sec band (the trades a wider window would recapture);
+          * reason 'trend'  — inside the live window but the trend filter blocked
+            it (the trades a looser trend_filter_sigma would recapture).
+        Each record carries trend_z + title/side/ts so it can be joined to the
+        SETTLE outcome offline (research/analyze_shadow_candidates.py), letting us
+        calibrate max_t_rem_sec / trend_filter_sigma on real data at zero risk.
+
+        Trades the live config WOULD have taken (in-window AND trend-OK) are NOT
+        logged here — those are real attempts already in shadow_taker.jsonl."""
+        shadow = getattr(self.exec, "shadow", None)
+        c = self.cfg["sniper"]
+        if shadow is None or not c.get("shadow_candidates", False) or not c["enabled"]:
+            return
+        key = {"5m": "shadow_max_t_rem_sec_5m", "15m": "shadow_max_t_rem_sec_15m",
+               "4h": "shadow_max_t_rem_sec_4h"}.get(
+                   m.kind, "shadow_max_t_rem_sec_hourly")
+        shadow_max = c.get(key, c.get("shadow_max_t_rem_sec", 0)) or 0
+        if not shadow_max:
+            return  # no shadow band configured for this kind
+        trem = m.t_remaining
+        close_buffer = self._close_buffer_sec(m)
+        if trem > shadow_max or trem < close_buffer:
+            return  # outside the shadow band entirely (cheap early out)
+        live_max = self._max_t_rem_sec(m)
+        min_t_rem = c.get("min_t_rem_sec") or 0
+        in_live_window = ((not live_max or trem <= live_max)
+                          and trem >= max(close_buffer, min_t_rem))
+        trend_z = self._momentum_z(c.get("trend_window_sec", 45.0)) or 0.0
+        trend_sigma = c.get("trend_filter_sigma", 0.0)
+        min_edge = c["min_edge"]
+        max_edge = c.get("max_edge", 0.25)
+        for side, fair, robust, token in (("up", p_up, p_lo, m.token_up),
+                                          ("dn", 1 - p_up, 1 - p_hi, m.token_down)):
+            if not self._book_fresh(token, c.get("max_book_age_sec", 15.0)):
+                continue
+            book = self.feed.books.get(token)
+            ask = book.best_ask() if book else None
+            if not ask:
+                continue
+            ask_px, ask_sz = ask
+            if ask_px < c.get("min_ask", 0.50) or ask_px > c.get("max_ask", 0.80):
+                continue
+            fee = m.taker_fee_per_share(ask_px)
+            net_edge = robust - ask_px - fee
+            if not (min_edge < net_edge <= max_edge):
+                continue
+            dist_sigma, dist_usd = self._distance_to_strike(m, side)
+            dist_floor = c.get("dist_sigma_min")
+            if dist_floor and dist_sigma is not None and dist_sigma < dist_floor:
+                continue
+            trending_against = ((side == "up" and trend_z <= -trend_sigma)
+                                or (side == "dn" and trend_z >= trend_sigma))
+            trend_block = trend_sigma > 0 and trending_against
+            # log ONLY counterfactuals (trades we did NOT take live); the rest are
+            # real fires already recorded in shadow_taker.jsonl.
+            if in_live_window and not trend_block:
+                continue
+            if not self._cooled(m.slug, "shadow-cand", side, 60):
+                continue
+            snap = shadow.snapshot(token)
+            shadow.log_candidate({
+                "slug": m.slug, "title": m.title, "kind": m.kind, "side": side,
+                "leg": "snipe", "t_remaining_s": round(trem, 1),
+                "seen_ask_px": snap["ask_px"], "seen_ask_sz": snap["ask_sz"],
+                "seen_mid": snap["mid"], "book_age_ms": snap["book_age_ms"],
+                "robust": round(robust, 4), "fair": round(fair, 4),
+                "net_edge": round(net_edge, 4),
+                "dist_sigma": round(dist_sigma, 3) if dist_sigma is not None else None,
+                "dist_usd": round(dist_usd, 2) if dist_usd is not None else None,
+                "trend_z": round(trend_z, 3), "trend_sigma": trend_sigma,
+                "trend_block": trend_block, "in_live_window": in_live_window,
+                "reason": "trend" if (in_live_window and trend_block) else "window",
+            })
 
     async def _scalp(self, m: Market, p_up: float, caps: dict) -> None:
         c = self.cfg["scalper"]
@@ -932,6 +1046,10 @@ class Strategy:
         for m, p_up, p_lo, p_hi in mark_rows:
             await self._market_make(m, p_up)
             await self._snipe(m, p_up, p_lo, p_hi, caps)
+            # observation-only: log would-be snipes a wider window / looser trend
+            # filter would take (no orders, off the fire path) — runs last so it
+            # can never delay a real fire. No-op unless sniper.shadow_candidates.
+            self._shadow_candidates(m, p_up, p_lo, p_hi)
             await self._scalp(m, p_up, caps)
 
         await self._settle_expired()

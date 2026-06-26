@@ -41,16 +41,26 @@ log = logging.getLogger("shadow")
 class ShadowTakerLogger:
     def __init__(self, feed, log_dir: str = "logs",
                  markout_horizons_sec: tuple[float, ...] = (2.0, 10.0),
-                 filename: str = "shadow_taker.jsonl") -> None:
+                 filename: str = "shadow_taker.jsonl",
+                 candidate_filename: str = "shadow_candidates.jsonl") -> None:
         self.feed = feed
         self.markout_horizons = tuple(float(h) for h in markout_horizons_sec)
         os.makedirs(log_dir, exist_ok=True)
         self.path = os.path.join(log_dir, filename)
+        # counterfactual would-be snipes the live gates declined (wider-window or
+        # trend-blocked) — kept in a SEPARATE file so the real-fill analysis above
+        # stays clean. Observation-only; never linked to an order.
+        self.cand_path = os.path.join(log_dir, candidate_filename)
         self._ids = itertools.count(1)
         log.info("shadow taker logger active -> %s (markouts at %s s)",
                  self.path, ", ".join(f"{h:g}" for h in self.markout_horizons))
 
     # ---------- book snapshot ----------
+
+    def snapshot(self, token: str) -> dict[str, Any]:
+        """Public alias — other observation-only paths (shadow candidates) reuse
+        the same book-snapshot shape."""
+        return self._snapshot(token)
 
     def _snapshot(self, token: str) -> dict[str, Any]:
         book = self.feed.books.get(token) if self.feed else None
@@ -168,6 +178,27 @@ class ShadowTakerLogger:
                 })
         except Exception as e:  # noqa: BLE001
             log.debug("shadow markout failed: %s", e)
+
+    # ---------- counterfactual candidates (observation-only) ----------
+
+    def log_candidate(self, rec: dict[str, Any]) -> None:
+        """Record a would-be snipe the LIVE gates declined (outside the live
+        timing window, or blocked by the trend filter), with trend_z and the
+        fields needed to join to settlement offline. Pure observation — it places
+        no order and is wrapped so a logging failure can never affect trading.
+        Used to calibrate max_t_rem_sec / trend_filter_sigma on real data at zero
+        risk."""
+        try:
+            out = {"id": next(self._ids), "ts": round(time.time(), 3),
+                   "type": "candidate"}
+            out.update(rec)
+            try:
+                with open(self.cand_path, "a") as f:
+                    f.write(json.dumps(out, separators=(",", ":")) + "\n")
+            except OSError as e:
+                log.debug("shadow candidate write failed: %s", e)
+        except Exception as e:  # noqa: BLE001 — never let observation break a trade
+            log.debug("shadow log_candidate failed: %s", e)
 
     # ---------- io ----------
 

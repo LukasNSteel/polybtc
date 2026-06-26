@@ -228,7 +228,17 @@ sniper:
   # 15m->120, 1h->300, 4h->180) — the edge per $ only improves as you gate later.
   # A kind key overrides the global max_t_rem_sec; 0/unset = full window.
   max_t_rem_sec: 0             # global fallback (0 = full window)
-  max_t_rem_sec_5m: 0          # 5m: full window
+  max_t_rem_sec_5m: 90         # 5m: last 90s only (2026-06-25). Selection backtest
+                               # on settled live 5m fills: the mid-window band
+                               # (60-180s to close) was the largest single bleed
+                               # (-$58); restricting to the final 90s + the 30s
+                               # close buffer below (the [30,90]s band) was the
+                               # best timing-only cut (+$37.97). INTERIM belt-and-
+                               # braces while the snipe trend_filter_sigma is tuned
+                               # from live shadow trend_z; the two levers overlap
+                               # (both cut trend-fading mid-window fires), so once
+                               # the trend filter is dialled in, revisit relaxing
+                               # this back toward full-window.
   max_t_rem_sec_15m: 0         # 15m: full window
   max_t_rem_sec_hourly: 900    # 1h: last 15 min
   max_t_rem_sec_4h: 300        # 4h: last 5 min
@@ -246,7 +256,11 @@ sniper:
   # global; 0/unset = no buffer (legacy). Composes with min_t_rem_sec (the
   # effective floor is the larger of the two).
   close_buffer_sec: 20         # global fallback
-  close_buffer_sec_5m: 20
+  close_buffer_sec_5m: 30      # 20->30 (2026-06-25). Pairs with max_t_rem_sec_5m
+                               # above to define the [30,90]s 5m snipe window. The
+                               # extra 10s widens the settlement-gap guard (fills
+                               # in the final seconds collapse onto the losing side)
+                               # and was part of the best-tested 5m band.
   close_buffer_sec_15m: 25
   close_buffer_sec_hourly: 45
   close_buffer_sec_4h: 60
@@ -265,6 +279,35 @@ sniper:
                                # richened too; +2 ticks recaptured ~38% of those
                                # rejects at ~1.3c/share, all +EV, with no extra
                                # adverse selection (research/analyze_taker_widen.py)
+  # TREND FILTER (2026-06-25). Skip a snipe that FADES a live momentum run — a
+  # BUY UP into a strong down-run or a BUY DN into a strong up-run. Live
+  # forensics found fading momentum was the dominant snipe loss driver (DOWN
+  # fills into an up-trend: -$24.83, 50% win); a selection backtest that re-ran
+  # settled 5m fills against a reconstructed momentum gate flipped the book
+  # strongly +EV (research/backtest_window_trend.py). Momentum = return over
+  # trend_window_sec in units of expected vol (same _momentum_z as the MM leg).
+  # Computed once per snipe call, pre-order, no I/O — it cannot slow the order
+  # POST, only prevent a fire. trend_z is logged on every SNIPE line and into
+  # shadow_taker.jsonl, so START CONSERVATIVE and tune DOWN from the live trend_z
+  # distribution of winners vs losers. 0 disables the gate (still logged).
+  trend_filter_sigma: 1.5      # block only clear fades (>=1.5σ against the bet)
+                               # for now; the [30,90]s 5m window above carries the
+                               # rest until shadow data pins the right threshold.
+  trend_window_sec: 45         # momentum lookback (matches the MM trend filter)
+  # SHADOW CANDIDATES (2026-06-25) — observation-only counterfactual logging.
+  # Records would-be snipes the live gates DECLINE (outside the live timing
+  # window, or trend-blocked) to logs/shadow_candidates.jsonl, with trend_z and
+  # the fields to join to settlement (research/analyze_shadow_candidates.py).
+  # Lets us calibrate max_t_rem_sec_5m / trend_filter_sigma on real data WITHOUT
+  # placing those orders. It runs after the live snipe, places nothing, and does
+  # no network — it cannot slow a real fire. The forensic backtest said widening
+  # the live window [30,90]->[30,150] would recapture LOSERS (the (90,150]s band
+  # was 38% win, -$67), so we are NOT widening — we are measuring the wider band
+  # live to confirm/deny before any change. 0/unset on a kind = no shadow band.
+  shadow_candidates: true
+  shadow_max_t_rem_sec_5m: 180 # observe 5m would-be fires out to 180s (the live
+                               # gate fires only to 90s); the (90,180]s slice is
+                               # the recapture set we are evaluating.
 
 scalper:
   # Restricted after the June 2026 study (research/REPORT.md, Test 3):

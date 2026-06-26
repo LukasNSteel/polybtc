@@ -148,8 +148,11 @@ async def amain(args: argparse.Namespace) -> None:
         tasks.append(executor.run_user_feed())
         tasks.append(executor.process_onchain())
         # keep the CLOB HTTP/2 connection warm (httpx idles it out at ~5s) so a
-        # sparse taker FAK rides a warm POST instead of a cold reconnect
-        tasks.append(executor.run_keepwarm())
+        # sparse taker FAK rides a warm POST instead of a cold reconnect. 1s
+        # cadence: the live shadow log showed the slow-POST tails (up to ~1.2s)
+        # rode connections idle ~2-3s, so ping often enough that a fire never
+        # finds a cold/stale socket.
+        tasks.append(executor.run_keepwarm(1.0))
         # pre-warm market-info caches (and, if enabled, keep the pre-signed
         # FAK ladder warm) for every market we currently trade
         tasks.append(executor.run_presigner(feed, lambda: list(markets.active.values())))
