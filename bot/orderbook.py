@@ -57,6 +57,35 @@ class OrderBookFeed:
             self._assets = set(assets)
             self._want_reconnect.set()
 
+    def apply_rest_book(self, asset: str, ob) -> bool:
+        """Apply a REST order-book snapshot (py_clob_client get_order_book result,
+        dict or object form) to the live book and stamp it fresh. Used ONLY by the
+        executor's periodic self-refresh to keep a quiet market's book from ageing
+        out of the sniper freshness gate (the 'manual bet wakes the bot' effect,
+        root-caused 2026-06-27). A REST snapshot of a QUIET token is genuinely
+        current, so stamping book.ts=now is real freshness, not a fake — the in-
+        flight adverse-selection risk is separate and already handled by the
+        distance/edge buffer + feed-lag re-validation. Returns True if applied."""
+        def _levels(side: str) -> dict[float, float]:
+            raw = (ob.get(side) if isinstance(ob, dict) else getattr(ob, side, None)) or []
+            out: dict[float, float] = {}
+            for x in raw:
+                try:
+                    p = float(x["price"] if isinstance(x, dict) else x.price)
+                    s = float(x["size"] if isinstance(x, dict) else x.size)
+                except (KeyError, TypeError, ValueError, AttributeError):
+                    continue
+                if s > 0:
+                    out[p] = s
+            return out
+
+        bids, asks = _levels("bids"), _levels("asks")
+        if not bids and not asks:
+            return False
+        book = self.books[asset]
+        book.bids, book.asks, book.ts = bids, asks, time.time()
+        return True
+
     def _handle(self, d: dict) -> None:
         et = d.get("event_type")
         asset = d.get("asset_id", "")

@@ -1182,6 +1182,49 @@ class LiveExecutor:
                 if token not in live_tokens:
                     del self._presigned[token]
 
+    async def run_book_refresh(self, feed, markets_provider,
+                               period: float, max_per_cycle: int = 8) -> None:
+        """OPTIONAL self-priming of the order-book freshness clock.
+
+        In a QUIET market no CLOB ws `book`/`price_change` arrives, so
+        feed.books[token].ts ages out and the sniper's max_book_age_sec gate
+        blocks every fire — this is exactly why a manual bet (which emits ws
+        updates) appears to 'wake' the bot (root-caused 2026-06-27). This loop
+        pulls a fresh REST snapshot for active tokens whose ws book has gone
+        stale and stamps it current, so the bot can act on genuinely-fresh-but-
+        quiet books WITHOUT relaxing the freshness gate.
+
+        SAFETY: runs on the shared to_thread pool (NEVER the latency-critical
+        _submit_pool), only touches STALE tokens (so it never clobbers a fresher
+        ws book), and caps refreshes per cycle to bound REST/rate-limit load.
+        period<=0 disables it entirely (default)."""
+        if period <= 0:
+            return
+        log.info("book self-refresh ON: stale active books re-pulled every %.1fs "
+                 "(<= %d/cycle) so quiet markets don't age out of the freshness gate",
+                 period, max_per_cycle)
+        while True:
+            await asyncio.sleep(period)
+            try:
+                markets = list(markets_provider())
+            except Exception as e:  # noqa: BLE001
+                log.debug("book-refresh: market provider failed: %s", e)
+                continue
+            stale_cut = time.time() - period
+            stale = []
+            for m in markets:
+                for token in (m.token_up, m.token_down):
+                    book = feed.books.get(token)
+                    if book is None or book.ts <= stale_cut:
+                        stale.append((token, book.ts if book else 0.0))
+            stale.sort(key=lambda x: x[1])          # oldest first
+            for token, _ in stale[:max_per_cycle]:
+                try:
+                    ob = await asyncio.to_thread(self.client.get_order_book, token)
+                    feed.apply_rest_book(token, ob)
+                except Exception as e:  # noqa: BLE001
+                    log.debug("book-refresh %s failed: %s", token, e)
+
     async def cancel(self, order_id: str) -> None:
         from py_clob_client_v2 import OrderPayload
         try:

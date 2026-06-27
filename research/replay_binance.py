@@ -345,14 +345,22 @@ def run(cfg, base, price, vol, ticks, obi=None):
                 continue
             cap_eff = cap
             fill_ask = ask
+            fill_px = ask                    # price we actually pay (see slack_payup)
             if nv[i]:
                 ask1 = au_next[i] if side == "up" else ad_next[i]
                 mid1 = midu_next[i] if side == "up" else midd_next[i]
                 # feed_lag: our WS book trails the engine; we re-validate against
-                # a fresher book. A favourable move that richened the quote past
-                # our limit (+slack) is a miss — we lose exactly the best fills.
+                # a fresher book. A move that richened the quote past our limit
+                # (+slack) is a miss — widening SLACK recaptures these, but...
                 if feedlag and ask1 > fill_ask + SLACK + 1e-9:
                     continue
+                # ...slack_payup: a recaptured fill where the ask richened in-flight
+                # does NOT fill at the cheap stale ask — we pay up to the fresher
+                # ask, capped at our limit (seen ask + SLACK). This is what makes a
+                # WIDER limit_slack_ticks a real trade-off (more fills, worse px),
+                # rather than free recapture. Off by default (back-compat).
+                if cfg.get("slack_payup") and ask1 > fill_ask:
+                    fill_px = min(ask1, fill_ask + SLACK)
                 # edge_contention: the cheaper the stale ask vs the fresher mid,
                 # the more contested the quote, so we win less of the displayed size.
                 if contention and mid1 > 0:
@@ -360,18 +368,18 @@ def run(cfg, base, price, vol, ticks, obi=None):
                     cap_eff = cap * (1.0 - min(1.0, discount / CONTENTION_SCALE))
             if cap_eff <= 0:
                 continue
-            fill_sh = min(want / ask, cap_eff * disp)
+            fill_sh = min(want / fill_px, cap_eff * disp)
             if fill_sh < 1:
                 continue
-            cost = fill_sh * ask
-            f = fill_sh * fee_ps(ask)
+            cost = fill_sh * fill_px
+            f = fill_sh * fee_ps(fill_px)
             won = uw[i] if side == "up" else (1 - uw[i])
             pnl = fill_sh * won - cost - f
             heapq.heappush(pend, (end_ep[i], pnl, cost))
             exposure += cost
             mkt_cost[cond[i]] += cost
             # tuple fields 0..7 unchanged for back-compat; 8=kind, 9=t_rem(s)
-            fills.append((cost, f, pnl, won, ask, side, int(end_ep[i]), float(ob[i]),
+            fills.append((cost, f, pnl, won, fill_px, side, int(end_ep[i]), float(ob[i]),
                           str(kind[i]), float(t_rem[i])))
     while pend:
         _, pnl, cost = heapq.heappop(pend)

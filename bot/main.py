@@ -156,6 +156,13 @@ async def amain(args: argparse.Namespace) -> None:
         # pre-warm market-info caches (and, if enabled, keep the pre-signed
         # FAK ladder warm) for every market we currently trade
         tasks.append(executor.run_presigner(feed, lambda: list(markets.active.values())))
+        # OPTIONAL: self-refresh stale order books so the sniper isn't gated off
+        # in quiet markets waiting for an external ws update (the 'manual bet
+        # wakes the bot' effect). 0 disables (default); off the fire path.
+        tasks.append(executor.run_book_refresh(
+            feed, lambda: list(markets.active.values()),
+            period=cfg.get("book_refresh_sec", default=0.0),
+            max_per_cycle=cfg.get("book_refresh_max_per_cycle", default=8)))
         log.warning("LIVE MODE: real orders will be placed.")
     else:
         executor = PaperExecutor(

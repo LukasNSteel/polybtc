@@ -264,11 +264,18 @@ sniper:
   close_buffer_sec_15m: 25
   close_buffer_sec_hourly: 45
   close_buffer_sec_4h: 60
-  max_book_age_sec: 3          # never snipe off a WS order book older than this
-                               # (was an implicit 15s). The favourite gate reads
-                               # the displayed ask, so it is only meaningful on a
-                               # CURRENT book — a stale snapshot is how a
-                               # pre-collapse ask passes the gate.
+  max_book_age_sec: 1          # tightened 3->1 (2026-06-27). Live diagnostic:
+                               # Polymarket's own order endpoint adds ~250-650ms
+                               # (network RTT is only ~80ms; our build/sign ~2ms),
+                               # so a fill already lands ~400ms behind the book we
+                               # saw. Firing off a 2-2.6s-stale snapshot (observed
+                               # in shadow_taker rejects) stacks ~3s of total lag =
+                               # pure adverse selection. We CANNOT win the latency
+                               # race (it's their engine), so fill QUALITY is the
+                               # only lever: never act on a book older than 1s. The
+                               # favourite gate reads the displayed ask, so it is
+                               # only meaningful on a CURRENT book — a stale snapshot
+                               # is how a pre-collapse ask passes the gate.
   max_inventory_frac: 0.25     # skip a side once net same-side inventory exceeds
                                # this fraction of max_position_usd: stacking one
                                # side on the same lagging signal built every
@@ -539,6 +546,24 @@ shadow:
   # observation: no effect on trading. Analyse with research/analyze_shadow.py.
   enabled: true
   markout_horizons_sec: [2, 10]
+
+# BOOK SELF-REFRESH (2026-06-27). The sniper only fires on a book younger than
+# sniper.max_book_age_sec (1s). book.ts only advances on a CLOB ws book/price_change
+# event, which only arrives on real market activity — so in a QUIET market the book
+# ages out and the bot gates itself off (the root cause of the 'manual bet wakes the
+# bot' effect: a manual order emits ws updates that refresh the book). This loop
+# pulls a fresh REST snapshot for active tokens whose ws book has gone stale and
+# stamps it current, so the bot can act on genuinely-fresh-but-quiet books WITHOUT
+# relaxing the freshness gate. Off the latency-critical path; stale-only; capped per
+# cycle to bound REST load. Set <= max_book_age_sec to actually keep books inside the
+# gate. 0 disables. Watch for clob rate-limit warnings after enabling.
+book_refresh_sec: 0.5           # = gate/2: reactive refresh keeps books <~0.6s old
+                                # so they never reach the 1s freshness gate (~100%
+                                # coverage). NOT lower: there's no freshness or
+                                # fill-quality gain below this (the ~400ms Polymarket
+                                # order path dominates), only rate-limit/connection-
+                                # contention risk. Watch 429s when changing.
+book_refresh_max_per_cycle: 8   # cap REST get_order_book calls per cycle (rate-limit guard)
 
 log_dir: logs
 state_file: state.json   # positions/cash survive restarts (run with --fresh to ignore)
