@@ -225,6 +225,22 @@ def main():
     assert "trend_z" in placed[0]["extra"], "trend_z missing from shadow extra"
     print(f"  [PASS] extra={placed[0]['extra']}")
 
+    # ---- SIDE GATE (snipe_sides) ----
+    print("\nside gate (snipe_sides=[up]) — DN paused, UP unaffected:")
+    # DN eligible + flat momentum would normally fire DN; with up-only it must NOT.
+    s = build(**DN_ELIG, trend_sigma=1.5, recent_return=FLAT,
+              sniper_extra={"snipe_sides": ["up"]})
+    check("DN paused by side gate", run_snipe(s, **DN_PROBS), expect_fire=False)
+    # UP eligible + flat still fires under up-only.
+    s = build(**UP_ELIG, trend_sigma=1.5, recent_return=FLAT,
+              sniper_extra={"snipe_sides": ["up"]})
+    check("UP unaffected by side gate", run_snipe(s, **UP_PROBS),
+          expect_fire=True, side="up")
+    # no snipe_sides == legacy both-sides: DN fires.
+    s = build(**DN_ELIG, trend_sigma=1.5, recent_return=FLAT)
+    check("DN fires when side gate unset", run_snipe(s, **DN_PROBS),
+          expect_fire=True, side="dn")
+
     # ---- shadow-candidate evaluator (observe-only, places nothing) ----
     print("\nshadow candidates — live window [30,90], shadow band out to 180:")
     WIN = dict(max_t_rem=90, close_buffer=30, shadow_max=180, shadow_on=True)
@@ -265,6 +281,13 @@ def main():
     s = build(**DN_ELIG, trend_sigma=1.5, recent_return=FLAT,
               max_t_rem=90, close_buffer=30, shadow_max=180, shadow_on=False)
     check_cand("disabled", run_shadow(s, **DN_PROBS, trem=150), expect_n=0)
+
+    # 6. side gate: DN in live window, trend OK (would be a REAL fire normally),
+    #    but DN paused -> logged as a counterfactual with reason 'side'.
+    s = build(**DN_ELIG, trend_sigma=1.5, recent_return=FLAT,
+              sniper_extra={"snipe_sides": ["up"]}, **WIN)
+    check_cand("trem60 DN paused -> side", run_shadow(s, **DN_PROBS, trem=60),
+               expect_n=1, reason="side", in_live=True)
 
     print("\nALL TREND-FILTER + SHADOW-CANDIDATE TESTS PASSED")
 

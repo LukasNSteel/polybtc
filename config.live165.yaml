@@ -84,12 +84,16 @@ markets:
   # at the close (a ~$50-100 basis moving in the final seconds) can settle
   # differently than they would live. Treat paper results near 50/50 closes
   # with extra skepticism.
+  # 2026-06-27: 5m-ONLY. Disabled 15m/hourly/4h to cut adverse-selection exposure
+  # in the durations our research barely covers — the edge model, distance floor,
+  # timing windows and the whole backtest suite are calibrated on 5m (kind_only
+  # "5m"); the longer markets are thin and least-validated. This is a GLOBAL gate
+  # (MarketManager won't even track them), so no leg — MM, snipe, or scalp — can
+  # touch them. Re-enable a duration only after it's been researched on its own.
   five_minute: true     # btc-updown-5m-{epoch} markets (resolve via Chainlink BTC/USD)
-  fifteen_minute: true  # btc-updown-15m-{epoch} markets (resolve via Chainlink BTC/USD);
-                        # the target account's single biggest day-1 volume bucket
-  hourly: true          # Bitcoin Up or Down hourly (resolve via Binance BTC/USDT 1h candle)
-  four_hour: true       # btc-updown-4h-{epoch} markets (resolve via Chainlink BTC/USD);
-                        # lower volume (~$145k/day vs hourly's ~$1M) but same window mechanics
+  fifteen_minute: false # PAUSED 2026-06-27 (was true): least-researched, adverse-selection risk
+  hourly: false         # PAUSED 2026-06-27 (was true): least-researched, adverse-selection risk
+  four_hour: false      # PAUSED 2026-06-27 (was true): low volume + least-researched
 
 trading:
   # stop placing orders this many seconds before window close, per market kind.
@@ -187,19 +191,34 @@ sniper:
                                # (min_edge, max_edge] band decouples size from a model
                                # that is least trustworthy precisely when it screams
                                # loudest. Still capped by displayed book size.
-  size_frac: 0.5               # flat stake = this fraction of the (tier-scaled)
-                               # max_take_usd; 0.5 * $10 = $5/snipe at this $165 tier
-                               # (~3% of bankroll), down from $10 at the $250 tier.
-  dist_sigma_min: 0.5          # SOFT distance-to-strike floor (2026-06-25). Skip
-                               # snipes where spot is < this many sigma from the
-                               # candle open in the bet's favour. Live review of 21
-                               # dsig-logged fills: <0.5σ entries won 33% (-$6.05
-                               # net, near-the-money coin-flips); >=0.5σ won 72%
-                               # (+$15.18). Floor is 0.5 NOT higher — the 0.5-1.0σ
-                               # band is the single most profitable, so >=1.0 would
-                               # cut winners. Fail-open: no gate when dσ is unknown.
-                               # Unset/0 disables. n=3 in the killed bucket — soft &
-                               # reversible; revisit as more dσ fills settle.
+  size_frac: 0.25              # 2026-06-27: dropped 0.5->0.25 to run live as a
+                               # near-zero-risk EXECUTION CANARY while we measure
+                               # fill quality (markout) on real fills. 0.25 * ($10
+                               # * ~0.95 scale) = ~$2.4 nominal, which floors to the
+                               # venue minimum of MIN_SHARES=5 (~$2.5-$4/snipe at
+                               # ask 0.5-0.8) — the SMALLEST order Polymarket allows,
+                               # so we cannot risk less while staying live. Purpose:
+                               # keep the shadow_taker REAL-FILL stream alive (the
+                               # only data that measures the ~400ms latency adverse-
+                               # selection shadow can't see) at minimal $ exposure.
+                               # Restore to 0.5 once the live edge is reconfirmed.
+  dist_sigma_min: 0.7          # SOFT distance-to-strike floor. Skip snipes where
+                               # spot is < this many sigma from the candle open in
+                               # the bet's favour. RAISED 0.5->0.7 (2026-06-28):
+                               # live obs of losses = "in-the-money most of the
+                               # window, flips under in the last few seconds" — the
+                               # near-the-money reversion tail (0.5σ implies ~31%
+                               # revert-and-lose by construction). The 13-week
+                               # archive distance sweep (research/backtest_distfloor
+                               # .py), which settles on the ACTUAL close so it
+                               # captures those flips, says 0.5 is the WORST ROI cell
+                               # and 0.7 is the robust sweet spot: win% 65->68%, ROI/$
+                               # +1.7->+3.9% (UP) / +2.6->+4.2% (both), maxDD ~halved
+                               # (124->69), only ~8% fewer fills. Monotonic win% across
+                               # both side-splits at >1k fills. (Supersedes the old
+                               # 21-fill "0.5 best" note.) NOT 1.5 yet — its higher ROI
+                               # comes with ~56% fewer fills + a noisier peak; revisit
+                               # with more live data. Fail-open when dσ unknown; 0 off.
   robust_betas: [0.83, 1.36]   # lead-stickiness regimes fitted per-day on 1,847
                                # markets: ~0.8-0.9 mean-reversion days, ~1.2-1.4
                                # momentum days. Entry must be +EV under BOTH.
@@ -306,6 +325,23 @@ sniper:
                                # 0.65 cut as 47-fill overfit — max_ask stays 0.80.)
                                # Keep tuning from the live trend_z / shadow record.
   trend_window_sec: 45         # momentum lookback (matches the MM trend filter)
+  # SIDE GATE (sniper.snipe_sides). 2026-06-27: DN paused as PRECAUTIONARY risk
+  # control, NOT a proven +EV edge — the data actually argues the other way, and
+  # this is documented honestly so it gets re-evaluated:
+  #   * live (research/deep_ev_analysis.py, 49 fills): DN 29 fills 41% win -$50,
+  #     UP 20 fills 68% win +$12 — BUT DN is only z=-0.9..-1.8 (NOT significant);
+  #     the loss was a few cap-sized adverse fills, not a clear edge collapse.
+  #   * 13-wk replay (research/backtest_sides.py + backtest_recency.py, 2,235
+  #     fills): DN is the BETTER side (+3.4% vs UP +1.7%) and STABLE, not stale —
+  #     recent half DN +1.9% still > UP +0.9%. Base rate of 5m Up = 50.45%
+  #     (z=+1.07, n.s.): no structural UP edge at this horizon (drift is priced in).
+  # The ONE real unknown: the archive ends ~5wk ago, so it's blind to a brand-new
+  # regime — which is exactly where the live DN losses sit. Pausing DN is cheap
+  # insurance against that unobserved regime (UP-only is still +EV), fully
+  # reversible, and DN keeps being scored by _shadow_candidates (reason 'side')
+  # into shadow_candidates.jsonl. RE-ENABLE (-> [up, dn]) once the live/shadow DN
+  # record shows DN flat-or-+EV over a meaningful sample (target >=40-50 DN obs).
+  snipe_sides: [up]            # DN paused (precautionary); DN -> shadow-only
   # SHADOW CANDIDATES (2026-06-25) — observation-only counterfactual logging.
   # Records would-be snipes the live gates DECLINE (outside the live timing
   # window, or trend-blocked) to logs/shadow_candidates.jsonl, with trend_z and
@@ -545,7 +581,15 @@ shadow:
   # ASSUMED taker_latency_ms / speed_bump_ms / capture / race_loss_prob. Pure
   # observation: no effect on trading. Analyse with research/analyze_shadow.py.
   enabled: true
-  markout_horizons_sec: [2, 10]
+  markout_horizons_sec: [2, 10, 30, 60]  # extended 2026-06-27 from [2,10]. Real-
+                               # fill markout is the ONLY view of execution quality
+                               # (shadow/backtest can't see it). The 10s read already
+                               # exposed the DN execution leak (UP +0.7c vs DN -4.5c
+                               # at 10s — the side gets PICKED OFF post-fill, the real
+                               # reason DN is live-negative despite +EV in backtest).
+                               # 30/60s show whether the pick-off persists or reverts,
+                               # so we can tune selection toward latency-robust signals
+                               # (research/markout_analysis.py). Pure observation.
 
 # BOOK SELF-REFRESH (2026-06-27). The sniper only fires on a book younger than
 # sniper.max_book_age_sec (1s). book.ts only advances on a CLOB ws book/price_change

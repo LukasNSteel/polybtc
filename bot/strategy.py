@@ -616,8 +616,22 @@ class Strategy:
         # backtest_window_trend.py). 0 == filter off (still logged).
         trend_z = self._momentum_z(c.get("trend_window_sec", 45.0)) or 0.0
         trend_sigma = c.get("trend_filter_sigma", 0.0)
+        # SIDE GATE (sniper.snipe_sides; unset/empty == both sides, legacy). When
+        # set (e.g. ["up"]) only the listed sides place REAL fires; the rest are
+        # routed to _shadow_candidates (reason 'side') so we keep a live outcome
+        # record for the paused side. 2026-06-27: DN paused as PRECAUTIONARY risk
+        # control, NOT a proven edge — live (49 fills) leans DN-negative but only
+        # ~1.5σ (n.s.), while the 13-wk replay says DN is fine/better and STABLE,
+        # and 5m Up base rate is 50.45% (no structural UP edge). The real unknown
+        # is a possible recent regime the ~5-wk-old archive can't see; UP-only is
+        # still +EV so this is cheap insurance. Re-enable -> [up, dn] once the
+        # live/shadow DN record is flat-or-+EV over a meaningful sample. See
+        # research/{deep_ev_analysis,backtest_sides,backtest_recency}.py + config.
+        snipe_sides = c.get("snipe_sides")  # e.g. ["up"]; None == both
         for side, fair, robust, token in (("up", p_up, p_lo, m.token_up),
                                           ("dn", 1 - p_up, 1 - p_hi, m.token_down)):
+            if snipe_sides and side not in snipe_sides:
+                continue  # disabled side: no real fire (shadow-logged instead)
             # don't stack one side past the inventory fraction: same lagging
             # model, not independent edge (every cap-sized loser in session
             # 1781212299 was stacked one-sided inventory)
@@ -777,6 +791,7 @@ class Strategy:
         trend_sigma = c.get("trend_filter_sigma", 0.0)
         min_edge = c["min_edge"]
         max_edge = c.get("max_edge", 0.25)
+        snipe_sides = c.get("snipe_sides")  # disabled sides -> reason 'side'
         for side, fair, robust, token in (("up", p_up, p_lo, m.token_up),
                                           ("dn", 1 - p_up, 1 - p_hi, m.token_down)):
             if not self._book_fresh(token, c.get("max_book_age_sec", 15.0)):
@@ -799,9 +814,12 @@ class Strategy:
             trending_against = ((side == "up" and trend_z <= -trend_sigma)
                                 or (side == "dn" and trend_z >= trend_sigma))
             trend_block = trend_sigma > 0 and trending_against
+            side_disabled = bool(snipe_sides) and side not in snipe_sides
             # log ONLY counterfactuals (trades we did NOT take live); the rest are
-            # real fires already recorded in shadow_taker.jsonl.
-            if in_live_window and not trend_block:
+            # real fires already recorded in shadow_taker.jsonl. A disabled side
+            # (snipe_sides) is a counterfactual too — log it (reason 'side') so we
+            # keep a live outcome record for the side we paused.
+            if in_live_window and not trend_block and not side_disabled:
                 continue
             if not self._cooled(m.slug, "shadow-cand", side, 60):
                 continue
@@ -817,7 +835,10 @@ class Strategy:
                 "dist_usd": round(dist_usd, 2) if dist_usd is not None else None,
                 "trend_z": round(trend_z, 3), "trend_sigma": trend_sigma,
                 "trend_block": trend_block, "in_live_window": in_live_window,
-                "reason": "trend" if (in_live_window and trend_block) else "window",
+                "side_disabled": side_disabled,
+                "reason": ("side" if side_disabled
+                           else "trend" if (in_live_window and trend_block)
+                           else "window"),
             })
 
     async def _scalp(self, m: Market, p_up: float, caps: dict) -> None:

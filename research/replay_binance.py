@@ -170,6 +170,10 @@ def compute_features(cfg, base, price, vol, ticks, obi=None):
     ix = s - base
     spot = price[ix]
     vv = vol[ix]
+    if cfg.get("vol_mult"):  # tail/clustering multiplier on model vol (calibration
+        vv = vv * cfg["vol_mult"]  # found vol_per_sec understated ~1.26x). Propagates
+        # to dist_sigma (smaller), prob_up/bounds (less confident -> lower edge), and
+        # the trend z — i.e. the FULL effect of making the model's vol read true.
     ob = obi[ix] if obi is not None else np.zeros(len(ix))
     openp = price[np.clip(d["start_ep"] - base, 0, len(price) - 1)]
     t_rem = (d["end_ep"] - s).astype(float)
@@ -245,6 +249,10 @@ def compute_features(cfg, base, price, vol, ticks, obi=None):
         th = cfg["dist_sigma_min"]
         cand_up &= dist_sigma >= th
         cand_dn &= dist_sigma <= -th
+    if cfg.get("dist_sigma_max"):  # optional distance CEILING (overextended cut)
+        th = cfg["dist_sigma_max"]
+        cand_up &= dist_sigma <= th
+        cand_dn &= dist_sigma >= -th
     if cfg.get("dist_usd_min"):
         th = cfg["dist_usd_min"]
         cand_up &= dist_usd >= th
