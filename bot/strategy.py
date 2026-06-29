@@ -359,6 +359,43 @@ class Strategy:
             return per_kind
         return self.cfg.get("sniper", "max_t_rem_sec", default=0) or 0
 
+    def _max_t_rem_sec_far(self, m: Market) -> float:
+        """High-conviction FAR-BAND ceiling (2026-06-29). Extends the snipe
+        window from the inner max_t_rem_sec out to this value, but the extra band
+        (max_t_rem_sec, max_t_rem_sec_far] only FIRES when distance-to-strike
+        clears the stricter dist_sigma_min_far floor (see _dist_sigma_floor). The
+        live shadow record showed UP snipes in the (90,170]s band are +EV ONLY for
+        strong favourites (dσ>=1.0: 83-88% win, +12-16c/sh) — at dσ<1.0 the band is
+        -EV, matching the forensic warning that a blanket widen recaptures losers.
+        So we widen with a conviction gate, not for everyone. Per-kind
+        max_t_rem_sec_{kind}_far overrides the global; 0/unset == NO far band
+        (identical to the legacy single-window behaviour). Should be >= the inner
+        max_t_rem_sec to have any effect."""
+        key = {"5m": "max_t_rem_sec_5m_far", "15m": "max_t_rem_sec_15m_far",
+               "4h": "max_t_rem_sec_4h_far"}.get(m.kind, "max_t_rem_sec_hourly_far")
+        per_kind = self.cfg.get("sniper", key, default=None)
+        if per_kind is not None:
+            return per_kind
+        return self.cfg.get("sniper", "max_t_rem_sec_far", default=0) or 0
+
+    def _dist_sigma_floor(self, m: Market, t_remaining: float) -> float | None:
+        """Distance-to-strike floor that applies at this t_remaining. The inner
+        window [.., max_t_rem_sec] uses sniper.dist_sigma_min (the 13-week-validated
+        0.7 sweet spot — see the config note). The extended far band
+        (max_t_rem_sec, max_t_rem_sec_far], which sits further from settlement and
+        reverts more, requires the stricter sniper.dist_sigma_min_far (strong
+        favourites only). dist_sigma is already horizon-normalised, so the same
+        number means '1σ of the move still to come' at either end of the window.
+        Returns None when no floor is configured. Falls back to the inner floor if
+        the far floor is unset, so a far band without its own floor degrades to a
+        plain widened window (config-only choice, not the recommended one)."""
+        inner = self.cfg.get("sniper", "dist_sigma_min", default=None)
+        max_t_rem = self._max_t_rem_sec(m)
+        far_floor = self.cfg.get("sniper", "dist_sigma_min_far", default=None)
+        if max_t_rem and t_remaining > max_t_rem and far_floor is not None:
+            return far_floor
+        return inner
+
     def _close_buffer_sec(self, m: Market) -> float:
         """Settlement-safety cutoff: refuse to snipe inside the final N seconds
         before a window closes. This is NOT the late-window EDGE gate
@@ -573,8 +610,14 @@ class Strategy:
         # the win rate (64%->70%+) and the best ROI/$ at a fraction of that
         # drawdown. $1000 tier -> last 60s, $250 tier -> last 30s. Unset/0 ==
         # trade the full window (legacy behavior).
+        # The far band (max_t_rem_sec_far) widens the ceiling for high-conviction
+        # fires; the extra (max_t_rem_sec, max_t_rem_sec_far] band is admitted by
+        # the window gate here but is then held to the stricter dist_sigma_min_far
+        # floor below (via _dist_sigma_floor), so only strong favourites fire that
+        # far out. Unset far ceiling -> effective_max == max_t_rem (legacy).
         max_t_rem = self._max_t_rem_sec(m)
-        if max_t_rem and m.t_remaining > max_t_rem:
+        effective_max = max(max_t_rem, self._max_t_rem_sec_far(m))
+        if effective_max and m.t_remaining > effective_max:
             return
         min_t_rem = c.get("min_t_rem_sec")
         if min_t_rem and m.t_remaining < min_t_rem:
@@ -689,20 +732,23 @@ class Strategy:
                 # bet's favour, in sigma of the remaining-horizon move (dist_sigma)
                 # and in dollars (dist_usd). Always logged into the shadow record.
                 dist_sigma, dist_usd = self._distance_to_strike(m, side)
-                # SOFT DISTANCE FLOOR (sniper.dist_sigma_min; unset == no gate).
-                # Live review of 21 dsig-logged fills: entries <0.5σ from strike
-                # won only 33% for -$6.05 net (near-the-money coin-flips), while
-                # >=0.5σ won 72% for +$15.18. The 0.5-1.0σ band is the single most
-                # profitable, so the floor is 0.5 — NOT higher (>=1.0 would cut the
-                # best band). Fail-open: never block when dσ can't be computed
-                # (e.g. missing open/vol), so a stale signal can't halt trading.
-                dist_floor = c.get("dist_sigma_min")
+                # SOFT DISTANCE FLOOR (band-aware). Inner window uses
+                # sniper.dist_sigma_min (0.7, the 13-wk sweet spot); the far band
+                # (beyond max_t_rem_sec) uses the stricter dist_sigma_min_far (1.0)
+                # because further from settlement only strong favourites are +EV.
+                # Live review of 21 dsig-logged fills: <0.5σ won 33% (-$6.05),
+                # >=0.5σ won 72% (+$15.18); the shadow far-band record: dσ<1.0 was
+                # -EV but dσ>=1.0 was 83-88% / +12-16c. Fail-open: never block when
+                # dσ can't be computed (missing open/vol), so a stale signal can't
+                # halt trading.
+                dist_floor = self._dist_sigma_floor(m, m.t_remaining)
                 if dist_floor and dist_sigma is not None and dist_sigma < dist_floor:
                     if self._cooled(m.slug, "snipe-dist", side, 30):
-                        log.info("SNIPE SKIP %s %s: dσ %.2f < floor %.2f — "
-                                 "near-the-money coin-flip (live <0.5σ won 33%%, "
-                                 ">=0.5σ won 72%%)",
-                                 m.title, side.upper(), dist_sigma, dist_floor)
+                        log.info("SNIPE SKIP %s %s: dσ %.2f < floor %.2f "
+                                 "(t_rem %.0fs) — below the conviction floor for "
+                                 "this window band",
+                                 m.title, side.upper(), dist_sigma, dist_floor,
+                                 m.t_remaining)
                     continue
                 # TREND FILTER gate. Skip bets that FADE a momentum run beyond the
                 # threshold: a BUY UP into a strong down-run, or a BUY DN into a
@@ -784,9 +830,16 @@ class Strategy:
         if trem > shadow_max or trem < close_buffer:
             return  # outside the shadow band entirely (cheap early out)
         live_max = self._max_t_rem_sec(m)
+        far_max = self._max_t_rem_sec_far(m)
+        far_floor = c.get("dist_sigma_min_far")
         min_t_rem = c.get("min_t_rem_sec") or 0
-        in_live_window = ((not live_max or trem <= live_max)
-                          and trem >= max(close_buffer, min_t_rem))
+        floor_lo = max(close_buffer, min_t_rem)
+        # inner [.., live_max] band fires regardless of the far floor; the far
+        # (live_max, far_max] band fires live ONLY for dσ>=far_floor (decided
+        # per-side below once dist_sigma is known). Trades that now fire live are
+        # NOT logged here (they land in shadow_taker.jsonl as real attempts); the
+        # sub-threshold far band IS still logged so we keep observing it.
+        in_inner = (not live_max or trem <= live_max) and trem >= floor_lo
         trend_z = self._momentum_z(c.get("trend_window_sec", 45.0)) or 0.0
         trend_sigma = c.get("trend_filter_sigma", 0.0)
         min_edge = c["min_edge"]
@@ -808,9 +861,17 @@ class Strategy:
             if not (min_edge < net_edge <= max_edge):
                 continue
             dist_sigma, dist_usd = self._distance_to_strike(m, side)
+            # observe the whole wide band at the INNER floor (0.7) so we keep
+            # eyes on the sub-conviction far slice; whether it FIRES live is
+            # decided by in_far (which applies the stricter far floor).
             dist_floor = c.get("dist_sigma_min")
             if dist_floor and dist_sigma is not None and dist_sigma < dist_floor:
                 continue
+            in_far = bool(far_max and live_max and live_max < trem <= far_max
+                          and trem >= floor_lo
+                          and (far_floor is None
+                               or (dist_sigma is not None and dist_sigma >= far_floor)))
+            in_live_window = in_inner or in_far
             trending_against = ((side == "up" and trend_z <= -trend_sigma)
                                 or (side == "dn" and trend_z >= trend_sigma))
             trend_block = trend_sigma > 0 and trending_against

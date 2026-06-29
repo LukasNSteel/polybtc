@@ -219,6 +219,15 @@ sniper:
                                # 21-fill "0.5 best" note.) NOT 1.5 yet — its higher ROI
                                # comes with ~56% fewer fills + a noisier peak; revisit
                                # with more live data. Fail-open when dσ unknown; 0 off.
+  dist_sigma_min_far: 1.0      # STRICTER floor for the far band (max_t_rem_sec_*_far).
+                               # Only applies to snipes beyond the inner
+                               # max_t_rem_sec ceiling; the inner window keeps the
+                               # 0.7 floor above. Set to the strong-favourite cut
+                               # the shadow record validated for (90,170]s UP
+                               # (dσ>=1.0: 83-88% win vs 54% at dσ<1.0). Unset ==
+                               # the far band degrades to the inner floor (a plain
+                               # widened window — NOT recommended; it recaptures
+                               # the -EV sub-conviction fires).
   robust_betas: [0.83, 1.36]   # lead-stickiness regimes fitted per-day on 1,847
                                # markets: ~0.8-0.9 mean-reversion days, ~1.2-1.4
                                # momentum days. Entry must be +EV under BOTH.
@@ -261,6 +270,26 @@ sniper:
   max_t_rem_sec_15m: 0         # 15m: full window
   max_t_rem_sec_hourly: 900    # 1h: last 15 min
   max_t_rem_sec_4h: 300        # 4h: last 5 min
+  # HIGH-CONVICTION FAR BAND (2026-06-29). Extends the 5m snipe ceiling from 90s
+  # out to 170s, but the extra (90,170]s band fires ONLY when dist_sigma clears
+  # dist_sigma_min_far (1.0) below — the inner [30,90]s band keeps its proven 0.7
+  # floor. Evidence: the live shadow_candidates record (research/analyze_gated.py
+  # + analyze_gated2.py) shows UP snipes the live window declined ONLY for timing:
+  #   * blanket (90,180]s UP:            67% win, +2.8c/sh   (n=51)
+  #   * + dist_sigma>=1.0:               83% win, +11.7c/sh  (n=23)
+  #   * + t_rem<=170 & dist_sigma>=1.0:  88% win, +16.2c/sh  (n=16)
+  # and dσ<1.0 in that band is -EV (54% / -4.5c), which is exactly the "widening
+  # recaptures losers" warning the forensic backtest raised — so we widen ONLY
+  # for strong favourites. UP fills there show NO post-fill adverse selection
+  # (markout ~flat/+), unlike DN (still paused). Per-kind *_far overrides the
+  # global max_t_rem_sec_far; 0/unset == no far band (legacy single window).
+  # CAVEAT: n=16 on the tight cell — directionally strong + mechanistically sound
+  # (dσ is horizon-normalised), but treat the magnitude as indicative; the win%
+  # will regress toward ~70-78% live. Revisit / tighten if drawdown rises.
+  max_t_rem_sec_5m_far: 170    # 5m: high-conviction extension to 170s
+  max_t_rem_sec_15m_far: 0     # off (15m already full window)
+  max_t_rem_sec_4h_far: 0      # off
+  max_t_rem_sec_hourly_far: 0  # off
   min_t_rem_sec: 0             # 0 = trade down to settlement (see $1k config).
   # SETTLEMENT-SAFETY CUTOFF (added June 23 after live session 1782200216).
   # Refuse to snipe inside the final N seconds before close. This is a SAFETY
